@@ -121,6 +121,14 @@ case (each part has a switch for A/B runs; the defaults are on):
 None of these changes the arithmetic of a token: the same rows are computed by the same kernels (the pipeline chunk
 can change which GEMM a prompt chunk takes, as `--prefill auto` already does per request).
 
+**Setup** does the same arithmetic before anything is downloaded: when the cards chosen with `--gpus` hold every expert
+(each card's VRAM less ~7 GB for its copy of the dense weights and its buffers, ~9 GB with UD-Q4_K_XL, less the
+context's KV cache once), the size menu says `fits entirely in the N GPUs`, the experts are mapped from the model
+files (`--mmap-experts`: read once at start to fill the caches, nothing kept in RAM, no `experts.bin` copy), UD-Q4_K_XL
+gets no RAM budget (a split of it no longer needs ~135 GB of RAM), the KV cache stays in VRAM and the recommended
+context is the model's 262K window when the cards still hold everything there. `--low-ram off` keeps the experts in
+RAM as before.
+
 `tools/multi_gpu_bench.py` measures a configuration: prompt and decode speed at given lengths through the engine's own
 numbers, and the generated tokens for an A/B comparison:
 

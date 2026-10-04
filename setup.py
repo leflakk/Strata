@@ -623,6 +623,16 @@ def split_budget(cfg: dict) -> bool:
     a = cfg.get("args", [])
     if "--resident-budget-gib" not in a:
         return False
+    cards = config_cards(cfg)
+    if gpus_hold_model("UD-Q4_K_XL", cards, *config_ctx_kv(cfg)):
+        # all on the GPUs: the split's cards hold every expert - mapped from the model files, nothing loaded into RAM
+        i = a.index("--resident-budget-gib")
+        del a[i:i + 2]
+        if "--mmap-experts" not in a:
+            a.append("--mmap-experts")
+        ok(f"UD-Q4_K_XL on {len(cards)} GPUs: they hold all of its experts, so no RAM budget and nothing loaded into "
+           "RAM - the experts are read from the model files once at start (--mmap-experts)")
+        return True
     need, ram = unsloth_split_need_gb(), ram_gb()
     if ram < need:
         fail(f"UD-Q4_K_XL cannot share its RAM budget across GPUs (the engine has no layer split with it), and without "
@@ -2058,6 +2068,43 @@ def low_ram_fits(model, ram, vram_gb) -> bool:
     return ram - 6 + max(0.0, vram_gb - 5) >= arena
 
 
+SPLIT_CARD_GB = 7      # a card of a layer split, beside its share of the experts: its copy of the dense weights (~3.5 GB),
+                       # its prompt buffers, verify windows and the VRAM reserve; +2 GB for UD-Q4_K_XL's 8-bit ones
+
+
+def vram_experts_gb(model, chosen, ctx=131072, kv="int8") -> float:
+    """About how many GB of experts the cards of a layer split hold together: each card's VRAM less SPLIT_CARD_GB, less
+    ~1 GB for the draft layer and its head (the last card) and the context's KV cache once (a split carves it by layer:
+    each card keeps only its own layers' share).  0 for one card."""
+    if len(chosen) < 2:
+        return 0.0
+    kv_tok = 13 * (576 if kv == "q4_0" else 1056)       # bytes per context token: 12 QSA layers + the draft layer
+    card = SPLIT_CARD_GB + (2 if MODELS[model].get("budget") else 0)
+    return max(0.0, sum(max(0.0, g["vram_gb"] - card) for g in chosen) - 1.0 - ctx * kv_tok / 1e9)
+
+
+def gpus_hold_model(model, chosen, ctx=131072, kv="int8") -> bool:
+    """ALL ON THE GPUS: the cards of a layer split hold every expert of the model, so none has to stay in RAM: setup
+    then maps them from the model files (--mmap-experts, read once at start to fill the GPUs' caches) whatever the
+    RAM, gives UD-Q4_K_XL no RAM budget, and keeps the KV cache in VRAM.  docs/MULTI_GPU.md."""
+    return len(chosen) >= 2 and vram_experts_gb(model, chosen, ctx, kv) >= MODELS[model]["arena_gb"]
+
+
+def config_cards(cfg: dict) -> list:
+    """The NVIDIA cards a config's "gpu" list names, as gpus() describes them (the ones it finds)."""
+    sel = cfg.get("gpu")
+    if not isinstance(sel, list):
+        return []
+    byid = {g["index"]: g for g in gpus()}
+    return [byid[i] for i in sel if i in byid]
+
+
+def config_ctx_kv(cfg: dict) -> tuple[int, str]:
+    a = cfg.get("args", [])
+    ctx = int(a[a.index("--max-context") + 1]) if "--max-context" in a[:-1] else 32768
+    return ctx, (a[a.index("--kv") + 1] if "--kv" in a[:-1] else "int8")
+
+
 def low_ram_one_gpu_why(model, ram, choice, sel=None) -> list[str]:
     """#250: why the low-RAM mode recommends one GPU, with the RAM math that turned it on; #364 #384: and how to use
     all of them (sel: the cards, for the --gpus example)."""
@@ -3210,6 +3257,10 @@ def main() -> int:
     for i, m in enumerate(names, 1):
         d = MODELS[m]
         fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
+        if multi and a.low_ram != "off" and gpus_hold_model(m, chosen, a.context or 131072, a.kv or "int8"):
+            say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB   <- fits entirely in the "
+                f"{len(chosen)} GPUs ({d['arena_gb']:.0f} GB of experts, nothing kept in RAM)")
+            continue
         if d.get("budget"):
             say(f"  {i}) {m} {d['about']}; download {d['download_gb']:.0f} GB, keeps ~"
                 f"{resident_budget_gib(m, ram)} GB of its {d['arena_gb']:.0f} GB of experts in RAM{fit}")
@@ -3221,7 +3272,28 @@ def main() -> int:
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget, q4_split = None, False
-    if MODELS[model].get("budget"):
+    # ALL ON THE GPUS (docs/MULTI_GPU.md): the chosen cards hold every expert of this model - none is kept in RAM, they
+    # are mapped from the model files and read once at start, so the RAM rules below do not apply (--low-ram off, or
+    # an explicit --resident-budget-gib, keeps them)
+    vram_all = (bool(multi) and a.low_ram != "off" and a.resident_budget_gib is None and
+                gpus_hold_model(model, chosen, a.context or 131072, a.kv or "int8"))
+    if vram_all:
+        ok(f"{model} fits entirely in {' + '.join(gpu_name(x) for x in chosen)}: ~"
+           f"{vram_experts_gb(model, chosen, a.context or 131072, a.kv or 'int8'):.0f} GB for its "
+           f"{MODELS[model]['arena_gb']:.0f} GB of experts - nothing is kept in RAM, the experts are read from the "
+           "model files once at start (--mmap-experts)")
+    if MODELS[model].get("budget") and vram_all:
+        warn(f"{model} is EXPERIMENTAL (docs/UNSLOTH_Q4.md); quality checked against llama.cpp")
+        if hip:
+            confirm_risk(f"{model} has not been run on AMD cards yet: its prompt kernels are NVIDIA-only, so on "
+                         f"{gpu_name(gpu)} long prompts read much more slowly, and it may not work at all",
+                         bool(a.model), a.yes, f"{model} is NVIDIA-only so far", "choose one of the 2-3-bit models, "
+                         f"or --model {model} --yes to try it on AMD anyway", "  Try it anyway?")
+            warn(f"installing {model} on an AMD card, as you chose (please report how it runs)")
+        q4_split = True                                # on several GPUs, without a RAM budget (all in VRAM)
+        if a.low_ram not in ("auto", "off"):
+            warn(f"--low-ram {a.low_ram} does not apply to {model}: its experts are read from the model files")
+    elif MODELS[model].get("budget"):
         # Unsloth's UD-Q4_K_XL: a RAM budget of experts, the rest from the GGUF on the SSD - not the low-RAM mode (no
         # experts.bin: it would be another 77 GB on the disk), and one GPU (the budget mode has no layer split) unless
         # the RAM holds the GGUFs and 24 GB more: then several, without the budget, if asked for (#498)
@@ -3253,9 +3325,9 @@ def main() -> int:
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
     elif a.resident_budget_gib is not None:
         warn(f"--resident-budget-gib is for UD-Q4_K_XL: {model} keeps all of its experts in RAM or in the low-RAM mode")
-    low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
-                                  (a.low_ram == "auto" and low_ram_needed(model, ram)))
-    if low_ram and multi and not low_ram_together(a, model, ram, gpu, chosen):
+    low_ram = budget is None and not q4_split and (vram_all or a.low_ram in ("on", "resident", "mmap") or
+                                                   (a.low_ram == "auto" and low_ram_needed(model, ram)))
+    if low_ram and multi and not vram_all and not low_ram_together(a, model, ram, gpu, chosen):
         multi, sel, chosen = [], [gpu["index"]], [gpu]
     # (the low-RAM mode's variant is decided once the context is known, below; on several GPUs it is the mapped one)
     if not low_ram and budget is None and ram < MODELS[model]["ram_gb"] - 4:
@@ -3266,6 +3338,8 @@ def main() -> int:
     rec_ctx = 32768 if small < 14 else 65536 if small < 20 else 131072
     if budget is not None:                             # UD-Q4_K_XL: every GB of KV is a GB fewer of cached experts
         rec_ctx = 8192 if small < 14 else 32768
+    if vram_all:                                       # the KV cache is split by layer across the cards too
+        rec_ctx = 262144 if gpus_hold_model(model, chosen, 262144, a.kv or "int8") else 131072
     # #406: the RAM rule is part of the recommendation (the smaller of the two), no longer a cap over the user's choice
     rec_ctx = min(rec_ctx, ram_ctx(model, ram, low_ram))
     if a.context:
@@ -3347,7 +3421,12 @@ def main() -> int:
         share = low_ram_gpu_share(model, vram, ctx, kv)
         rest = arena - low_ram_gpu_gb(model, vram, ctx, kv)
         resident = a.low_ram == "resident" or (a.low_ram != "mmap" and low_ram_resident(model, ram, vram, ctx, kv))
-        if multi:      # #364 #384: every chosen card's share (the image encoder on the main one), the mapped variant
+        if vram_all:   # all on the GPUs: mapped, nothing read from the files once the caches are filled
+            share, resident = 1.0, False
+            if not gpus_hold_model(model, chosen, ctx, kv):
+                warn(f"at {ctx // 1024}K context the GPUs may no longer hold every expert of {model}: the ones they do "
+                     "not hold are read from the model files while it answers (slower); a shorter context keeps them all")
+        elif multi:    # #364 #384: every chosen card's share (the image encoder on the main one), the mapped variant
             held = min(arena, low_ram_gpu_gb(model, vram, ctx, kv) +
                        sum(low_ram_gpu_gb(model, x["vram_gb"], ctx, kv) for x in chosen[1:]))
             share, resident = held / arena, False
@@ -3409,7 +3488,8 @@ def main() -> int:
     to_fetch = 0 if a.gguf_dir or have_model else max(MODELS[model]["download_gb"] - on_disk, 0)
     need = to_fetch + 8 + \
         (40 if model == "Q2_0" and avx512 and family == "qwen" else 0) + (1 if vision != "none" else 0) + \
-        (MODELS[model]["arena_gb"] + 1 if low_ram and not (model == "Q2_0" and avx512 and family == "qwen") else 0)
+        (MODELS[model]["arena_gb"] + 1 if low_ram and not vram_all and not (model == "Q2_0" and avx512 and family == "qwen")
+         else 0)
     if free_gb(models_dir) < need:
         fail(f"not enough free disk space in {models_dir}: need ~{need:.0f} GB" +
              (f" ({on_disk:.0f} GB of the model is already there)" if on_disk >= 1 and not have_model else ""),
@@ -3513,7 +3593,7 @@ def main() -> int:
         # (UD-Q4_K_XL: --compat-bf16 - its Q8_0 hyper-connection projections become BF16, the form the engine reads)
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
              *fam.get("pack_args", [])], env=env)
-    if low_ram and not (pack / "experts.bin").exists():
+    if low_ram and not vram_all and not (pack / "experts.bin").exists():   # all on the GPUs: the GGUF in place
         say(f"  Writing the experts into one file for the low-RAM mode (one time, {MODELS[model]['arena_gb']:.0f} GB) ...")
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
              "--experts-bin"], env=env)
@@ -3582,6 +3662,8 @@ def main() -> int:
                  "only about 1 GB there): off")
     elif ctx >= 65536 and a.kv_streaming == "off":
         ok("KV streaming off, as you chose (--kv-streaming off): the KV cache stays in VRAM")
+    elif ctx >= 65536 and vram_all and a.kv_streaming != "on":
+        ok("KV streaming off: the GPUs hold every expert, so the KV cache stays in VRAM (split by layer across them)")
     elif ctx >= 65536 and (stream_fits or a.kv_streaming == "on"):
         args += ["--kv-resident", "32768"]
         ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram_gb:.1f} GB), more experts fit in VRAM")
@@ -3601,6 +3683,8 @@ def main() -> int:
         warn("--kv-streaming on: a context under 64K is not streamed (the attention's window holds all of it): off")
     if budget is not None and not q4_split:   # UD-Q4_K_XL: the experts read from the GGUF in place, the most-used N
         args += ["--resident-budget-gib", f"{budget:g}"]   # GiB kept in RAM (#498: a layer split has no budget)
+    if q4_split and vram_all:                 # all on the GPUs: mapped from the GGUFs, nothing loaded into RAM
+        args += ["--mmap-experts"]
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
     if a.vram_reserve_mib is not None:                 # #493: VRAM left free for other programs (only when given)

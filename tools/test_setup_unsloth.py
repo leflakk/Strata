@@ -431,5 +431,98 @@ class LayerSplit(unittest.TestCase):
         self.assertNotIn("Use both", out)
 
 
+class AllOnTheGpus(unittest.TestCase):
+    """docs/MULTI_GPU.md: when the cards of a layer split hold every expert, nothing is kept in RAM - the experts are
+    mapped from the model files (--mmap-experts), UD-Q4_K_XL gets no RAM budget, the KV cache stays in VRAM, and the
+    RAM rules (the 135 GB a UD-Q4_K_XL split needed, the experts.bin copy) do not apply."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "tools"))
+        from test_setup_golden import card
+        self.card = card
+
+    def cards(self, n, vram=24.0):
+        return [self.card(i, "NVIDIA GeForce RTX 3090", vram, "86") for i in range(n)]
+
+    def test_the_estimate(self):
+        self.assertEqual(setup.vram_experts_gb(M, self.cards(1)), 0.0)           # one card is no split
+        self.assertTrue(setup.gpus_hold_model(M, self.cards(8)))                 # 8 x 15 - 1 - 1.8 = 117 GB >= 77
+        self.assertFalse(setup.gpus_hold_model(M, self.cards(4)))                # 57 GB
+        self.assertTrue(setup.gpus_hold_model("IQ3_S", self.cards(4)))           # 4 x 17 - 2.8 = 65 GB >= 50.3
+        self.assertFalse(setup.gpus_hold_model("IQ3_S", self.cards(3)))          # 48 GB
+        self.assertTrue(setup.gpus_hold_model("IQ1_M", self.cards(2), 32768))    # the Coder on two 24 GB cards
+        self.assertFalse(setup.gpus_hold_model("Q2_0", self.cards(2, 11.9)))
+
+    def test_ud_q4_on_eight_cards_with_123_gb(self):
+        from test_setup_golden import install
+        argv = ["--family", "unsloth", "--model", M, "--context", "131072", "--gpus", "all", "--no-start"]
+        code, out, cfg, _ = install(123.0, self.cards(8), argv)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["gpu"], list(range(8)))
+        self.assertEqual(cfg["layer_split"], "auto")
+        self.assertIn("--mmap-experts", cfg["args"])
+        for flag in ("--resident-budget-gib", "--resident-experts", "--kv-resident"):
+            self.assertNotIn(flag, cfg["args"])
+        self.assertIn("fits entirely in", out)
+        self.assertIn("KV streaming off: the GPUs hold every expert", out)
+        self.assertNotIn("runs on one GPU", out)
+
+    def test_ud_q4_on_four_cards_keeps_the_ram_rule(self):
+        from test_setup_golden import install
+        argv = ["--family", "unsloth", "--model", M, "--context", "32768", "--gpus", "0,1,2,3", "--no-start"]
+        code, out, cfg, _ = install(123.0, self.cards(4), argv)
+        self.assertEqual(code, 0, out)
+        self.assertIn("runs on one GPU here", out)                              # 123 GB < its GGUFs + 24 GB
+        self.assertNotIn("layer_split", cfg)
+
+    def test_iq3_s_on_four_cards_with_64_gb(self):
+        from test_setup_golden import install
+        argv = ["--family", "qwen", "--model", "IQ3_S", "--gpus", "0,1,2,3", "--no-start"]
+        code, out, cfg, _ = install(63.7, self.cards(4), argv)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["gpu"], [0, 1, 2, 3])
+        self.assertIn("--mmap-experts", cfg["args"])
+        self.assertNotIn("--resident-experts", cfg["args"])
+        self.assertNotIn("--kv-resident", cfg["args"])
+        self.assertEqual(cfg["args"][cfg["args"].index("--max-context") + 1], "262144")   # the model's window
+        self.assertNotIn("low-RAM mode on 4 GPUs", out)
+        self.assertNotIn("Writing the experts into one file", out)          # no experts.bin: the GGUF in place
+
+    def test_low_ram_off_keeps_ram(self):
+        from test_setup_golden import install
+        argv = ["--family", "qwen", "--model", "IQ3_S", "--gpus", "0,1,2,3", "--low-ram", "off", "--no-start",
+                "--context", "32768"]
+        code, out, cfg, _ = install(127.8, self.cards(4), argv)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("--mmap-experts", cfg["args"])
+        self.assertNotIn("fits entirely in", out)
+
+    def test_start_with_gpus_maps_when_they_hold_it(self):
+        from test_setup_risk import run
+        found = self.cards(8)
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / "strata.exe"
+            exe.write_bytes(b"")
+            p = Path(d) / "strata-unsloth-ud-q4_k_xl.json"
+            p.write_text(json.dumps({"exe": str(exe), "gpu": 0, "gpus_asked": True,
+                                     "args": ["--pack", "p", "--resident-budget-gib", "40", "--kv", "int8",
+                                              "--max-context", "131072"]}))
+            call = mock.Mock(return_value=0)
+            with mock.patch.object(setup, "gpus", lambda: found), \
+                    mock.patch.object(setup, "ram_gb", lambda: 63.7), \
+                    mock.patch.object(setup, "engine_runs_on", lambda g: True), \
+                    mock.patch.object(setup, "ensure_engine_for", lambda cards, path, cfg, yes: cfg), \
+                    mock.patch.object(setup, "is_wsl", lambda: False), \
+                    mock.patch.object(setup.subprocess, "call", call):
+                code, out, _ = run(setup.start, p, None, list(range(8)), False, True)
+            cfg = json.loads(p.read_text())
+        self.assertIsNone(code, out)
+        self.assertTrue(call.called)
+        self.assertEqual(cfg["gpu"], list(range(8)))
+        self.assertNotIn("--resident-budget-gib", cfg["args"])
+        self.assertIn("--mmap-experts", cfg["args"])
+        self.assertIn("they hold all of its experts", out)
+
+
 if __name__ == "__main__":
     unittest.main()
