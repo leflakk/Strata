@@ -597,6 +597,110 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
 }
 
 
+#if !defined(__HIPCC__)
+// ---- the same top-k past the register kernel's capacity (a --max-context over ~135K cells: every decode window there,
+// and the prompt path's queries), where block_topk_kernel ran: one CTA of 256 threads per query making four radix
+// passes over the scores with one shared histogram.  A query's scores sit in a few exponents, so the first passes'
+// increments hit one or two bins and serialize (8x RTX 3090, a 250K context: ~0.4 ms per QSA layer and decode window,
+// ~20% of the window).  Here: 1,024 threads, the radix passes read the scores coalesced, each warp keeps its own
+// histogram and the lanes of one digit add as one (__match_any_sync); the count and the writes keep each thread's
+// contiguous blocks, as before.  The selection rule is block_topk_kernel's (radix threshold, ties to the lowest index,
+// cells ascending): identical ids.  CUDA (sm_70+: __match_any_sync); HIP keeps block_topk_kernel.
+constexpr int TW_T = 1024;   // block_excl_scan's 32 warps
+__global__ void __launch_bounds__(TW_T) block_topk_wide_kernel(const float* __restrict__ scores,
+                                                               const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                               int64_t cap, int32_t* __restrict__ ids) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+    __shared__ int hist[TW_T / 32][256];
+    __shared__ int s_warp[33];
+    __shared__ int s_digit, s_above;
+    const int64_t qi = blockIdx.x;
+    const int32_t* st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
+    int32_t* out = ids + qi * cap;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    if (n_kv <= width) {                               // everything is selected: the identity, ascending
+        for (int64_t j = t; j < n_kv; j += TW_T) out[j] = (int32_t) j;
+        return;
+    }
+    const float* sc = scores + qi * max_blocks;
+    const int64_t nb = n_bid + 1;                      // blocks 0..n_bid, the last possibly empty
+    const int w_last = (int) (n_kv - n_bid * R);       // the last block's cells (the others hold R)
+    uint32_t prefix = 0;
+    int above = 0;                                     // cells strictly above the digits fixed so far
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = lane; i < 256; i += 32) hist[warp][i] = 0;
+        __syncwarp();
+        const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+        // every lane of a warp runs every iteration (the match takes them all); block b = base + t, coalesced
+        for (int64_t base = 0; base < nb; base += TW_T) {
+            const int64_t b = base + t;
+            const uint32_t k = b < nb ? order_key(sc[b]) : 0u;
+            const bool match = b < nb && (k & hi_mask) == (prefix & hi_mask);
+            const unsigned d = (k >> shift) & 255u;
+            const bool full = match && b < n_bid;      // R cells; the last block adds its own count below
+            const unsigned grp = __match_any_sync(0xffffffffu, full ? d : 256u + (unsigned) lane);
+            if (full && lane == __ffs(grp) - 1) atomicAdd(&hist[warp][d], R * __popc(grp));
+            if (match && b == n_bid && w_last > 0) atomicAdd(&hist[warp][d], w_last);
+        }
+        __syncthreads();
+        if (t < 256) {                                 // fold the warps' histograms into warp 0's
+            int s = 0;
+            for (int w2 = 0; w2 < TW_T / 32; ++w2) s += hist[w2][t];
+            hist[0][t] = s;
+        }
+        __syncthreads();
+        if (t == 0) {
+            int cum = above, dd = 255;
+            for (; dd > 0; --dd) {
+                if (cum + hist[0][dd] >= width) break;
+                cum += hist[0][dd];
+            }
+            s_digit = dd;
+            s_above = cum;
+        }
+        __syncthreads();
+        prefix |= (uint32_t) s_digit << shift;
+        above = s_above;
+        __syncthreads();
+    }
+    const uint32_t thr = prefix;
+    const int64_t eq_budget = width - above;           // cells equal to thr that fit, lowest index first
+    const int64_t per = (nb + TW_T - 1) / TW_T;
+    const int64_t b0 = (int64_t) t * per, b1 = (b0 + per < nb) ? b0 + per : nb;
+    int gt = 0, eq = 0;
+    for (int64_t b = b0; b < b1; ++b) {
+        const int w = b < n_bid ? R : w_last;
+        if (w == 0) continue;
+        const uint32_t k = order_key(sc[b]);
+        if (k > thr) gt += w;
+        else if (k == thr) eq += w;
+    }
+    int tot;
+    const int eq_before = block_excl_scan(eq, s_warp, tot);
+    int64_t my_eq = eq_budget - eq_before;
+    if (my_eq < 0) my_eq = 0;
+    if (my_eq > eq) my_eq = eq;
+    const int sel = gt + (int) my_eq;
+    int64_t wpos = block_excl_scan(sel, s_warp, tot);
+    int64_t eq_left = my_eq;
+    for (int64_t b = b0; b < b1; ++b) {
+        const int w = b < n_bid ? R : w_last;
+        if (w == 0) continue;
+        const uint32_t k = order_key(sc[b]);
+        if (k > thr) {
+            for (int c = 0; c < w; ++c) out[wpos++] = (int32_t) (b * R + c);
+        } else if (k == thr) {
+            for (int c = 0; c < w && eq_left > 0; ++c, --eq_left) out[wpos++] = (int32_t) (b * R + c);
+        }
+    }
+#else
+    (void) scores; (void) steps; (void) max_blocks; (void) cap; (void) ids;
+    __trap();
+#endif
+}
+#endif  // !__HIPCC__
+
 // Block scores with every key block read ONCE for all of a call's queries (block_scores_kernel's grid is
 // (max_blocks / 8) x nq: ~24,600 mostly-idle blocks per layer at a decode window, each key re-read per query).  A fixed
 // grid strides over the blocks; per (block, query) the same arithmetic in the same order as block_scores_kernel.
@@ -1093,6 +1197,31 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     const bool too_small = false;
 #endif
     if (old || too_small || reach > fit) {
+#if !defined(__HIPCC__)
+        // past the register kernel's capacity: the 1,024-thread kernel (the same ids) on sm_70+.  STRATA_TOPK_WIDE=0: the
+        // 256-thread kernel; =decode: the 1,024-thread one for calls of a few queries only (the decode windows)
+        static const int wide = [] {
+            const char* v = std::getenv("STRATA_TOPK_WIDE");
+            return !v ? 2 : std::strcmp(v, "decode") == 0 ? 1 : std::atoi(v) != 0 ? 2 : 0;
+        }();
+        static int wide_ok[64] = {};   // per device: 1 sm_70+, 2 older
+        int wdev = 0;
+        if (!old && wide > 0 && (wide == 2 || nq <= CL_MAXQ) && cudaGetDevice(&wdev) == cudaSuccess && wdev >= 0 &&
+            wdev < 64) {
+            if (wide_ok[wdev] == 0) {
+                int major = 0;
+                wide_ok[wdev] = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, wdev) == cudaSuccess &&
+                                        strata::cc_major_of(major) >= 7 ? 1 : 2;
+                cudaGetLastError();
+            }
+            if (wide_ok[wdev] == 1 && s.idx_block == R && cap >= qsa_selection_width(kTopkMaxCells, s)) {
+                block_topk_wide_kernel<<<(unsigned) nq, TW_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+                const cudaError_t e = cudaGetLastError();
+                if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk wide: %s\n", cudaGetErrorString(e)); std::exit(1); }
+                return;
+            }
+        }
+#endif
         qsa_block_topk_ref(scores, steps, nq, max_blocks, cap, s, ids, stream);
         return;
     }

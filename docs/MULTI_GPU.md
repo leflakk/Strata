@@ -125,6 +125,13 @@ case (each part has a switch for A/B runs; the defaults are on):
   kernel's rows where it wrote them instead of adding them into zeroed rows first (two kernels less per layer).
   `STRATA_RESIDENT_ROWS=parts`: the copy, as before.
 
+**Long contexts on RTX 20/30/40 cards** (any number of cards): past the register kernel's capacity (a `--max-context`
+over ~135K cells, so every decode window of a 262K context), the attention's block selection took a one-CTA kernel
+whose histogram increments serialized; on 4x RTX 3090 at a 250K context it cost ~0.4 ms per attention layer and decode
+window (~20% of the window). It now runs a 1,024-thread kernel with per-warp histograms and the lanes of one digit
+adding once - the same selection rule, so the same cells (RTX 50 cards keep their cluster kernel).
+`STRATA_TOPK_WIDE=0`: the previous kernel; `=decode`: the new one for decode windows only.
+
 **The n-gram table in RAM** (`--ple-io ram`, Linux): the table (28.8 GB) is read once at start and locked, instead of
 16 unbuffered SSD reads per token. On 8x RTX 3090 with every expert in VRAM, the first card waited 3.4 s for those
 reads over a 32K prompt (the pipeline's slowest stage), and every decode window waited ~0.9 ms on its first card. Setup
