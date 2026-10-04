@@ -2068,6 +2068,8 @@ def low_ram_fits(model, ram, vram_gb) -> bool:
     return ram - 6 + max(0.0, vram_gb - 5) >= arena
 
 
+PLE_TABLE_GB = 28.8    # the n-gram (PLE) table: 320,001,536 rows of 90 bytes (IQ4_NL), when the GGUF does not say
+PLE_RAM_LEFT_GB = 16   # RAM beside it with --ple-io ram: the OS, the engine, the server
 SPLIT_CARD_GB = 7      # a card of a layer split, beside its share of the experts: its copy of the dense weights (~3.5 GB),
                        # its prompt buffers, verify windows and the VRAM reserve; +2 GB for UD-Q4_K_XL's 8-bit ones
 
@@ -3030,6 +3032,10 @@ def main() -> int:
     ap.add_argument("--kv-streaming", choices=["auto", "on", "off"], default="auto",
                     help="from a 64K context: keep the KV cache in RAM and only the attention's window in VRAM (more "
                          "experts fit on the GPU); auto: when the RAM has room for it")
+    ap.add_argument("--ple-io", choices=["auto", "direct", "ram"], default="auto",
+                    help="the n-gram (PLE) table: direct = read from the SSD as tokens need its rows (the default "
+                         "before), ram = read once at start and locked in RAM (Linux; ~29 GB of RAM); auto: ram when the "
+                         "GPUs hold every expert and the RAM has room for it")
     ap.add_argument("--backend", choices=["cuda", "hip"],
                     help="cuda = NVIDIA (default), hip = AMD RX 7900 / 7800 / 7700 XT, RX 9060 XT / 9070 / AI PRO R9700 on "
                          "Linux or Windows (chosen by itself when the PC has no NVIDIA card Strata can use)")
@@ -3681,6 +3687,25 @@ def main() -> int:
                  f"would take them out of it: {resident_budget_gib(model, ram, kv_ram_gb)} GiB); kept as you chose")
     elif a.kv_streaming == "on":
         warn("--kv-streaming on: a context under 64K is not streamed (the attention's window holds all of it): off")
+    # the n-gram (PLE) table, 16 rows per token: read from the SSD as they are needed (direct, the default), or read once
+    # at start and locked in RAM (--ple-io ram).  With every expert on the GPUs the RAM they no longer take holds it,
+    # and the SSD reads leave the prompt path's first card and every decode window (measured on 8x RTX 3090: the first
+    # card waited 3.4 s on them over a 32K prompt).  Linux only (mlock).
+    ple_gb = PLE_TABLE_GB
+    try:
+        t = next(x for x in GGUFFile(ple).tensors if x.name == "per_layer_token_embd.weight")
+        ple_gb = (t.expected_bytes() or 0) / 1e9 or PLE_TABLE_GB
+    except (StopIteration, AttributeError, TypeError, OSError):
+        pass
+    ple_ram = a.ple_io == "ram" or (a.ple_io == "auto" and vram_all and not WIN and not is_wsl() and
+                                     ram >= ple_gb + PLE_RAM_LEFT_GB)
+    if ple_ram and WIN:
+        warn("--ple-io ram needs Linux (mlock): the n-gram table stays on the SSD")
+        ple_ram = False
+    if ple_ram:
+        args += ["--ple-io", "ram"]
+        ok(f"n-gram table: read once at start and kept in RAM ({ple_gb:.0f} GB, --ple-io ram): no SSD reads while it "
+           "answers")
     if budget is not None and not q4_split:   # UD-Q4_K_XL: the experts read from the GGUF in place, the most-used N
         args += ["--resident-budget-gib", f"{budget:g}"]   # GiB kept in RAM (#498: a layer split has no budget)
     if q4_split and vram_all:                 # all on the GPUs: mapped from the GGUFs, nothing loaded into RAM

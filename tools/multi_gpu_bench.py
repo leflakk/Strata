@@ -3,12 +3,14 @@
 Starts the engine a setup config describes (strata-*.json), optionally on other GPUs, with a layer split, extra engine
 arguments or environment switches, then sends prompts of the given lengths (built from this repository's source, so
 any PC can rebuild the same ones) and reads the engine's own DONE numbers: prompt tokens read and the time it took,
-tokens generated and the time it took.  Every request starts with its own line, so no conversation checkpoint is
-reused and every prompt is read in full.
+tokens generated and the time it took.  Every request starts with its own line (--tag, the length, the repeat), so no
+conversation checkpoint is reused and every prompt is read in full; runs with the same --tag read the same prompts
+whatever their --label, so their tokens can be compared.
 
     python tools/multi_gpu_bench.py strata-iq3_s.json --gpus 0,1,2,3 --lengths 4096,32768 --max-new 256
     python tools/multi_gpu_bench.py strata-iq3_s.json --gpus all --env STRATA_SPLIT_PIPELINE=0 --label old-pipeline
     python tools/multi_gpu_bench.py strata-iq3_s.json --gpus all --tokens-out a.json      # the generated ids too
+    python tools/multi_gpu_bench.py strata-iq3_s.json --gpus all --set "--ple-io ram" --set --mmap-experts
     python tools/multi_gpu_bench.py --compare a.json b.json                             # same tokens? (greedy A/B)
 
 One JSON line per request goes to --out (appended), a table to the terminal.  Greedy decoding (temperature 0) unless
@@ -107,11 +109,23 @@ def main() -> int:
     ap.add_argument("--max-new", type=int, default=256)
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--temperature", type=float, default=0.0)
-    ap.add_argument("--label", default="")
+    ap.add_argument("--label", default="", help="names the run in the output (not part of the prompts)")
+    ap.add_argument("--tag", default="bench", help="the word every prompt starts with: two runs with the same tag read "
+                                                    "the same prompts, so --compare can match their tokens")
     ap.add_argument("--out", default="multi_gpu_bench.jsonl", help="JSON lines appended here")
     ap.add_argument("--tokens-out", help="the generated ids of every request, as JSON (for --compare)")
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"), help="compare two --tokens-out files and exit")
-    a = ap.parse_args()
+    # `--set --mmap-experts` (a value that starts with "--") is taken as --set=--mmap-experts
+    argv, i = [], 0
+    raw = sys.argv[1:]
+    while i < len(raw):
+        if raw[i] == "--set" and i + 1 < len(raw):
+            argv.append("--set=" + raw[i + 1])
+            i += 2
+        else:
+            argv.append(raw[i])
+            i += 1
+    a = ap.parse_args(argv)
     if a.compare:
         return compare(Path(a.compare[0]), Path(a.compare[1]))
     if not a.config:
@@ -168,10 +182,10 @@ def main() -> int:
         return r
 
     try:
-        one(prompt(tok, body, 512, f"{label} warm-up"), "warm-up")
+        one(prompt(tok, body, 512, f"{a.tag} warm-up"), "warm-up")
         for L in lengths:
             for rep in range(a.repeats):
-                r = one(prompt(tok, body, L, f"{label} {L} #{rep}"), f"{L}#{rep}")
+                r = one(prompt(tok, body, L, f"{a.tag} {L} #{rep}"), f"{L}#{rep}")
                 rows.append(r)
                 print(f"[{label}] {L:>7} tokens #{rep}: prompt {r['read']} tok in {r['prompt_ms']:.0f} ms = "
                       f"{r['prompt_tps']} tok/s | decode {r['generated']} tok = {r['decode_tps']} tok/s "

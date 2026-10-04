@@ -4398,9 +4398,10 @@ int main(int argc, char** argv) {
         // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned (#253) a
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
-        // a split's overlapped hand-off buffers (Prefill::init) only where the card keeps the VRAM reserve and 1 GiB
-        // more free after them: the verify windows, the draft head and the BLAS workspaces are allocated after this
-        strata::prefill::Prefill::set_handoff_reserve(((uint64_t) std::max(0, o.vram_reserve_mib) << 20) + (1ull << 30));
+        // a split's overlapped hand-off buffers (Prefill::init) only where the card keeps the VRAM reserve and 512 MiB
+        // more free after them: what is allocated after this - the verify window (75 MiB), the draft head on the last
+        // stage (~180 MiB), the penalty rows and the graphs - fits there (1 GiB kept the last of four 3090s from them)
+        strata::prefill::Prefill::set_handoff_reserve(((uint64_t) std::max(0, o.vram_reserve_mib) << 20) + (512ull << 20));
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];

@@ -466,6 +466,7 @@ class AllOnTheGpus(unittest.TestCase):
         self.assertIn("fits entirely in", out)
         self.assertIn("KV streaming off: the GPUs hold every expert", out)
         self.assertNotIn("runs on one GPU", out)
+        self.assertEqual(cfg["args"][cfg["args"].index("--ple-io") + 1], "ram")      # the RAM holds the n-gram table
 
     def test_ud_q4_on_four_cards_keeps_the_ram_rule(self):
         from test_setup_golden import install
@@ -496,6 +497,22 @@ class AllOnTheGpus(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertNotIn("--mmap-experts", cfg["args"])
         self.assertNotIn("fits entirely in", out)
+        self.assertNotIn("--ple-io", cfg["args"])                                     # the SSD reader, as before
+
+    def test_ple_io_choices(self):
+        from test_setup_golden import install
+        base = ["--family", "qwen", "--model", "IQ3_S", "--gpus", "0,1,2,3", "--no-start", "--context", "32768"]
+        code, out, cfg, _ = install(40.0, self.cards(4), base)                       # all in VRAM, too little RAM
+        self.assertEqual(code, 0, out)
+        self.assertIn("--mmap-experts", cfg["args"])
+        self.assertNotIn("--ple-io", cfg["args"])
+        code, out, cfg, _ = install(127.8, self.cards(4), base + ["--ple-io", "direct"])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("--ple-io", cfg["args"])
+        code, out, cfg, _ = install(127.8, self.cards(1), ["--family", "qwen", "--model", "IQ3_S", "--no-start",
+                                                           "--context", "32768", "--ple-io", "ram"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["args"][cfg["args"].index("--ple-io") + 1], "ram")     # asked for, one GPU
 
     def test_start_with_gpus_maps_when_they_hold_it(self):
         from test_setup_risk import run

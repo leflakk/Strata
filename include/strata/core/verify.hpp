@@ -226,6 +226,12 @@ private:
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
+    // the window graph's second branch (STRATA_VERIFY_FORK): independent kernels of a layer run beside the main chain
+    // - the shared expert beside the router and the routed experts, a DeltaNet layer's alpha/beta and z projections
+    // beside its qkv projection and convolution.  Captured as graph edges: the same kernels on the same data.
+    cudaStream_t side_ = nullptr;
+    cudaEvent_t fork_ev_[2] = {}, join_ev_[2] = {};
+    bool fork_ = false;
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t commit_exec_ = nullptr;
 

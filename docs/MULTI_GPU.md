@@ -117,6 +117,18 @@ case (each part has a switch for A/B runs; the defaults are on):
   the host step on every card; `STRATA_STAGE_CHAIN=0`: each card waited for by the host.
 - **Commits without waiting**: after a window every card commits its state on its own stream; the next window follows
   on the same streams. `STRATA_SPLIT_COMMIT_SYNC=1`: each card's commit waited for, as before.
+- **Two branches per layer in the window graph** (one card or several): the shared expert runs beside the router and
+  the routed experts, and a DeltaNet layer's alpha/beta and z projections beside its qkv projection and convolution -
+  the same kernels on the same data, as parallel branches of the graph. `STRATA_VERIFY_FORK=0`: one chain. (The
+  `STRATA_VERIFY_PROFILE` columns of the branched kernels then read near zero: their time is under the main chain's.)
+- **No row copy in resident-only windows**: every routed expert is a hit there, so the combine reads the grouped
+  kernel's rows where it wrote them instead of adding them into zeroed rows first (two kernels less per layer).
+  `STRATA_RESIDENT_ROWS=parts`: the copy, as before.
+
+**The n-gram table in RAM** (`--ple-io ram`, Linux): the table (28.8 GB) is read once at start and locked, instead of
+16 unbuffered SSD reads per token. On 8x RTX 3090 with every expert in VRAM, the first card waited 3.4 s for those
+reads over a 32K prompt (the pipeline's slowest stage), and every decode window waited ~0.9 ms on its first card. Setup
+turns it on when the GPUs hold every expert and the RAM has room (the table + 16 GB); `--ple-io direct|ram` chooses.
 
 None of these changes the arithmetic of a token: the same rows are computed by the same kernels (the pipeline chunk
 can change which GEMM a prompt chunk takes, as `--prefill auto` already does per request).

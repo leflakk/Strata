@@ -180,6 +180,11 @@ Verifier::~Verifier() {
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
     if (chain_ev_) cudaEventDestroy(chain_ev_);
+    for (int i = 0; i < 2; ++i) {
+        if (fork_ev_[i]) cudaEventDestroy(fork_ev_[i]);
+        if (join_ev_[i]) cudaEventDestroy(join_ev_[i]);
+    }
+    if (side_) { cudaStreamSynchronize(side_); cudaStreamDestroy(side_); }
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_, h_rskip_};
@@ -352,6 +357,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: stream create failed";
         return false;
     }
+    // STRATA_VERIFY_FORK=0: one chain per window (no second branch)
+    fork_ = [] { const char* v = std::getenv("STRATA_VERIFY_FORK"); return v == nullptr || v[0] != '0'; }();
+    if (fork_) {
+        bool ok3 = cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking) == cudaSuccess;
+        for (int i = 0; ok3 && i < 2; ++i)
+            ok3 = cudaEventCreateWithFlags(&fork_ev_[i], cudaEventDisableTiming) == cudaSuccess &&
+                  cudaEventCreateWithFlags(&join_ev_[i], cudaEventDisableTiming) == cudaSuccess;
+        if (!ok3) { (void) cudaGetLastError(); fork_ = false; }
+    }
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";
         return false;
@@ -414,6 +428,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2) ? 2 : 1;
+    // the second branch (fork_), with one token group only: a split window's two groups share xq_, which the shared
+    // expert and the next group's mixer would then write at the same time
+    const bool fork = fork_ && G == 1;
+    auto fork_side = [&](int i) {   // the side stream joins the capture here: what it runs waits for cs's work so far
+        return cudaEventRecord(fork_ev_[i], cs) == cudaSuccess && cudaStreamWaitEvent(side_, fork_ev_[i], 0) == cudaSuccess;
+    };
+    auto join_side = [&](int i) {   // and cs waits for what the side stream ran
+        return cudaEventRecord(join_ev_[i], side_) == cudaSuccess && cudaStreamWaitEvent(cs, join_ev_[i], 0) == cudaSuccess;
+    };
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
@@ -538,15 +561,26 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                // alpha/beta and z need only xm and its q8_1 copy: with the fork they run beside qkv + conv
+                if (fork) {
+                    if (!fork_side(0)) { err = "verify: the GDN branch failed"; return false; }
+                    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                 (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
+                                 (int) HV, n, side_);
+                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, side_);
+                }
                 native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
                 stamp(l, 2, grp);
                 gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
                 stamp(l, 3, grp);
-                gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
-                             (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
-                             n, cs);
+                if (!fork)
+                    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                 (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
+                                 (int) HV, n, cs);
                 stamp(l, 4, grp);
-                native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
+                if (!fork)
+                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
+                else if (!join_side(0)) { err = "verify: the GDN branch failed"; return false; }
                 stamp(l, 5, grp);
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
@@ -681,6 +715,36 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         stamp(l, 16, grp);
         gr_read_group(1, true, inj_, inj2_);
+        // the shared expert: its weights, then its rows on stream `st` (it reads xm only, and writes xq_ as its own
+        // q8_1 scratch: nothing on the router / routed-experts chain reads xq_ before the next layer's mixer)
+        auto shared_expert = [&](cudaStream_t st) -> bool {
+            const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
+                            *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
+            if (!wgi || !wsg || !wsu || !wsd) return false;
+            if (!native_of(wsg, v.name("ffn_gate_shexp.weight"), err) || !native_of(wsu, v.name("ffn_up_shexp.weight"), err) ||
+                !native_of(wsd, v.name("ffn_down_shexp.weight"), err))
+                return false;
+            NativeSharedWeights nsw;
+            nsw.gate_type = wsg->native_type; nsw.gate_data = wsg->native_data;
+            nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
+            nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
+            nsw.q8_1 = xq_;
+            if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, st);   // contiguous rows
+            else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, st);
+            try {
+                shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
+                                    sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, st);
+            } catch (const std::exception& e) {
+                err = std::string("verify shared expert: ") + e.what();
+                return false;
+            }
+            return true;
+        };
+        // with the fork, beside the router, the plan and the routed experts; post() joins it before the combine
+        if (fork && (!fork_side(1) || !shared_expert(side_))) {
+            if (err.empty()) err = "verify: the shared expert's branch failed";
+            return false;
+        }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
@@ -714,28 +778,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
         }
         stamp(l, 17, grp);
-        {
-            const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
-                            *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
-            if (!wgi || !wsg || !wsu || !wsd) return false;
-            if (!native_of(wsg, v.name("ffn_gate_shexp.weight"), err) || !native_of(wsu, v.name("ffn_up_shexp.weight"), err) ||
-                !native_of(wsd, v.name("ffn_down_shexp.weight"), err))
-                return false;
-            NativeSharedWeights nsw;
-            nsw.gate_type = wsg->native_type; nsw.gate_data = wsg->native_data;
-            nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
-            nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
-            nsw.q8_1 = xq_;
-            if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, cs);   // contiguous rows
-            else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
-            try {
-                shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
-                                    sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs);
-            } catch (const std::exception& e) {
-                err = std::string("verify shared expert: ") + e.what();
-                return false;
-            }
-        }
+        if (!fork && !shared_expert(cs)) return false;
         if (strata::kernels::cpu::expert_layout().native)
             quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
         else
@@ -786,9 +829,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         };
         grouped(p_ptr, p_start, p_counts, 0);
         stamp(l, 20, grp);
+        // resident-only: every row is a hit, and the grouped kernel wrote each into hit_out at its entry's row - the
+        // combine reads them there (STRATA_RESIDENT_ROWS=parts: copied into zeroed parts first, 0 + hit, as before)
+        static const bool rows_env = [] { const char* v = std::getenv("STRATA_RESIDENT_ROWS"); return v == nullptr || std::string(v) != "parts"; }();
+        const bool rows_direct = resident_only_ && rows_env;
         if (resident_only_) {
             // no PCIe share and no CPU share: the rows are the hits alone (moe_hit_add below writes every one of them)
-            if (cudaMemsetAsync(parts_ + (size_t) tb * K * N, 0, (size_t) n * K * N * sizeof(float), cs) != cudaSuccess) {
+            if (!rows_direct &&
+                cudaMemsetAsync(parts_ + (size_t) tb * K * N, 0, (size_t) n * K * N * sizeof(float), cs) != cudaSuccess) {
                 err = "verify: the resident-only window's row reset failed";
                 return false;
             }
@@ -823,16 +871,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
         }
         }   // !resident_only_
-        moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+        if (!rows_direct) moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+        float* rows = rows_direct ? hit_out : parts_ + (size_t) tb * K * N;   // this group's (token, k) rows
+        if (fork && !join_side(1)) { err = "verify: the shared expert's branch failed"; return false; }   // shared_
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
-                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+                native_moe_combine_multi(rows, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         for (int t = tb; t < te; ++t) {
             MoEBuffers mb = ss.moe;
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
-            if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
+            if (!moe_combine_parts(g, l, K, mb, rows + (size_t) (t - tb) * K * N, bo_ + t * N, cs, err)) return false;
         }
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
