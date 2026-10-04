@@ -471,6 +471,88 @@ __global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int
     __threadfence();
     *skip = ring;
 }
+// The same plan, one thread per entry (n <= kResidentPlanThreads): the serial kernel above walks O(n^2) loads on one
+// thread, ~48 times per window - a resident-only window plans every layer this way, so it is on the critical path.
+// Entry i's group is the rank of its expert's first occurrence among the first occurrences; its place in the group is
+// the number of entries of the same expert before it: the serial loop's layout and order exactly.
+constexpr int kResidentPlanThreads = 128;
+__global__ void resident_plan_par_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
+                                         int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
+                                         long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip,
+                                         uint32_t ring) {
+    __shared__ int32_t e_s[kResidentPlanThreads];
+    __shared__ int32_t first_s[kResidentPlanThreads];   // the index of entry i's expert's first occurrence
+    __shared__ int32_t group_s[kResidentPlanThreads];   // at a first occurrence: its group
+    __shared__ int32_t count_s[kResidentPlanThreads];   // per group: its entries
+    __shared__ int32_t start_s[kResidentPlanThreads + 1];
+    __shared__ int miss, groups;
+    const int i = (int) threadIdx.x;
+    if (i == 0) miss = 0;
+    __syncthreads();
+    int32_t e = -1;
+    if (i < n) {
+        e = ids[i];
+        e_s[i] = e;
+        if (e < 0 || e >= n_expert || res[e] < 0) miss = 1;
+    }
+    __syncthreads();
+    if (miss) {
+        if (i == 0) *skip = 0;
+        return;
+    }
+    int f = i;
+    if (i < n) {
+        for (int j = 0; j < i; ++j)
+            if (e_s[j] == e) { f = j; break; }
+        first_s[i] = f;
+    }
+    __syncthreads();
+    if (i < n && f == i) {
+        int g = 0, c = 0;
+        for (int j = 0; j < i; ++j) g += first_s[j] == j;
+        for (int j = i; j < n; ++j) c += e_s[j] == e;
+        group_s[i] = g;
+        count_s[g] = c;
+    }
+    __syncthreads();
+    if (i == 0) {
+        int g = 0, acc = 0;
+        for (int j = 0; j < n; ++j) g += first_s[j] == j;
+        for (int q = 0; q < g; ++q) { start_s[q] = acc; acc += count_s[q]; }
+        start_s[g] = acc;
+        groups = g;
+    }
+    __syncthreads();
+    int32_t* counts = pl;
+    int32_t* start = pl + 4;
+    int32_t* dst = start + capx + 1;
+    int32_t* tok = dst + capx;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
+    int32_t* start2 = pl + ptr_off + 4 * capx;
+    if (i < n) {
+        const int g = group_s[f];
+        int rank = 0;
+        for (int j = f; j < i; ++j) rank += e_s[j] == e;
+        dst[start_s[g] + rank] = i;
+        tok[start_s[g] + rank] = i / k;
+        if (f == i) {
+            const int32_t slot = res[e];
+            ptr[g] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+            start[g] = start_s[g];
+        }
+    }
+    if (i == 0) {
+        start[groups] = start_s[groups];
+        start2[0] = start_s[groups];
+        counts[0] = groups;
+        counts[1] = start_s[groups];
+        counts[2] = 0;
+    }
+    __syncthreads();
+    __threadfence();
+    if (i == 0) *skip = ring;
+}
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
     if (*skip == value) return;
     while (*flag < value) strata_spin_pause();
@@ -492,8 +574,14 @@ __global__ void copy_or_zero_kernel(float4* __restrict__ dst, const volatile flo
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream) {
-    resident_plan_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
-                                                             blob, plan, capx, skip, ring);
+    // STRATA_RESIDENT_PLAN_SERIAL=1: the one-thread kernel (the A/B; the same plan)
+    static const bool serial = std::getenv("STRATA_RESIDENT_PLAN_SERIAL") != nullptr;
+    if (!serial && n_entries <= kResidentPlanThreads)
+        resident_plan_par_kernel<<<1, kResidentPlanThreads, 0, (cudaStream_t) stream>>>(
+            ids, n_entries, k, res_layer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring);
+    else
+        resident_plan_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base,
+                                                                 slot_off, blob, plan, capx, skip, ring);
     check("resident_plan");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {

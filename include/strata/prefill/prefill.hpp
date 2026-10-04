@@ -82,6 +82,16 @@ public:
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
 
+    /// Layer split: the VRAM a stage must still have free after `init` allocates the overlapped hand-off buffers (a
+    /// device snapshot of a chunk's rows on a stage that hands on, two landing buffers on a stage that receives); with
+    /// less, that stage keeps the hand-off copies on its compute stream.  Default 1.5 GiB.  Set before `init`.
+    static void set_handoff_reserve(uint64_t bytes);
+
+    /// The chunk `run` reads in, at most the laid-out one (`chunk()`); 0 (the default) = the laid-out chunk.  A layer
+    /// split sets it per request on its first stage: a prompt cut into more, smaller chunks keeps every stage of the
+    /// pipeline busy sooner.  The later stages read each chunk as it arrives.
+    void set_run_chunk(int64_t tokens) { run_chunk_ = tokens; }
+
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
@@ -115,7 +125,9 @@ public:
     /// device `init` runs on.  A stage that does not start at layer 0 reads each chunk's residual rows from the
     /// previous stage instead of embedding the tokens; a stage that does not end at the last layer copies its rows
     /// to pinned host buffers (two, allocated by `init`) and runs `next` on them - on a thread, so the next stage
-    /// reads chunk c while this one reads chunk c + 1.  `on_chunk` belongs on the last stage.  Set before `init`.
+    /// reads chunk c while this one reads chunk c + 1, and every stage of a longer split reads its own chunk at the
+    /// same time (a stage hands on without waiting for the later ones; the first stage's `run` waits for all of them
+    /// before it returns).  `on_chunk` belongs on the last stage.  Set before `init`.
     void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
@@ -123,7 +135,16 @@ public:
 private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
+    int64_t run_chunk_ = 0;             ///< set_run_chunk
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    const float* hand_dev_ = nullptr;   ///< ...or already on this device (the overlapped hand-off), else null
+    void* hand_ev_ = nullptr;           ///< (cudaEvent_t) hand_dev_ holds them once this event has completed
+    /// The pipeline's hand-off, on the thread that runs the next stage's chunk: `hand_land` starts copying the rows
+    /// onto the next stage's device (true when it did), `hand_run` runs the chunk there once its previous chunk is done.
+    bool hand_land(int b, float* rows, void* landed, int64_t T);
+    bool hand_run(int b, bool staged, float* rows, void* landed, const int64_t* tokens, int64_t T, int64_t pos0);
+    /// The first stage, before its `run` returns: waits for every chunk handed on to every later stage.
+    bool drain(std::string& err);
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;

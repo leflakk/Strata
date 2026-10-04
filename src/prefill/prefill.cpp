@@ -110,6 +110,18 @@ double g_pinned_share = 1.0;
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
 // the host copies are the limit and the bigger ring only takes cache slots).  STRATA_PREFILL_RING overrides.
 int g_ring_override = 0;   // #340: set by a layer split (Prefill::set_ring_override); 0 = the rule below
+// Layer split: the VRAM a stage keeps free after its overlapped hand-off buffers (Prefill::set_handoff_reserve).
+uint64_t g_handoff_reserve = 3ull << 29;
+// STRATA_SPLIT_HANDOFF=sync: every stage copies its rows on its compute stream (the A/B of the overlapped copies);
+// STRATA_SPLIT_PIPELINE=0: a stage's run waits for the later stages' chunk again (the old two-stage overlap).
+inline bool handoff_async() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_SPLIT_HANDOFF"); return e == nullptr || std::string(e) != "sync"; }();
+    return v;
+}
+inline bool split_pipeline() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_SPLIT_PIPELINE"); return e == nullptr || e[0] != '0'; }();
+    return v;
+}
 // #136: the fused experts (STRATA_PF_FUSED=1) launch on a batch of a layer's streamed experts at once, so the ring
 // should hold a whole layer's (~460 of 512 on Q2_0): with 384 slots a layer's last batch waits for slots its own
 // first batch frees.  Measured on the 5070, Q2_0, the 4K / 32K code-agent prompts (one run each): fused at 384 slots
@@ -492,6 +504,21 @@ struct Prefill::Impl {
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
     float* hand[2] = {};
+    // the pipeline: the next stage's run of the chunk last written to hand[b] (they run in order, each after the one
+    // before), the error one of them returned, and the buffer the next chunk is handed on in
+    std::shared_future<bool> down[2];
+    std::string down_err;
+    int hand_next = 0;
+    // the overlapped hand-off, where the card has room for it (set_handoff_reserve): a stage that hands on copies a
+    // chunk's rows into `snap` on the device and the copy engine moves them to hand[b] while it reads the next chunk;
+    // a stage that receives gets them copied into stage_in[b] while it still reads the chunk before
+    float* snap = nullptr;
+    bool snap_pending = false;               // a copy out of snap may be in flight (hand_out_ev of the last chunk)
+    cudaStream_t hand_cs = nullptr;          // those copies
+    cudaEvent_t hand_out_ev[2] = {};         // hand[b] holds the rows once it has completed
+    float* stage_in[2] = {};
+    cudaEvent_t stage_in_ev[2] = {};         // stage_in[b] holds the rows once it has completed
+    int64_t stage_in_cap = 0;                // tokens a stage_in buffer holds
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
@@ -546,8 +573,11 @@ void Prefill::reset() {
 
 void Prefill::release() {
     if (!impl_) return;
+    for (auto& f : impl_->down)   // a chunk still handed on reads hand[b] and this stage's state
+        if (f.valid()) f.wait();
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
+    if (impl_->hand_cs) cudaStreamSynchronize(impl_->hand_cs);
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -556,7 +586,10 @@ void Prefill::release() {
         if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
         if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
+        if (impl_->hand_out_ev[b]) cudaEventDestroy(impl_->hand_out_ev[b]);
+        if (impl_->stage_in_ev[b]) cudaEventDestroy(impl_->stage_in_ev[b]);
     }
+    if (impl_->hand_cs) cudaStreamDestroy(impl_->hand_cs);
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     for (void* p : impl_->owned) cudaFree(p);
@@ -771,6 +804,47 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     if (!carve(T, &o)) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
         return false;
+    }
+    // THE OVERLAPPED HAND-OFF (layer split).  A chunk's rows (T x hc x n_embd floats: 80 MiB at 2048 tokens) used to
+    // cross with the stages' GPUs idle: the D2H at the end of the chunk on the compute stream, the next stage's H2D at
+    // the start of its chunk on its own.  On an x4 link that is ~15 ms each way per 2048 tokens, ~20% of a stage's
+    // chunk when eight cards share the layers.  Here a stage that hands on keeps a device snapshot (the D2H then runs
+    // on a copy stream while it reads the next chunk) and a stage that receives keeps two landing buffers (the H2D runs
+    // while it still reads the chunk before).  The same bytes in the same rows: the output is unchanged.  Only where
+    // the card keeps g_handoff_reserve free after them; otherwise this stage copies on its compute stream, as before.
+    if (handoff_async() && split_pipeline() && (next_ != nullptr || stage_lb_ > 0)) {
+        const size_t one = T * (size_t) D * 4;
+        const size_t want = (next_ != nullptr ? one : 0) + (stage_lb_ > 0 ? 2 * one : 0);
+        size_t fb = 0, tb = 0;
+        if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); fb = 0; }
+        bool got = fb >= want + g_handoff_reserve &&
+                   cudaStreamCreateWithFlags(&m.hand_cs, cudaStreamNonBlocking) == cudaSuccess;
+        for (int b = 0; got && b < 2; ++b) {
+            if (next_ != nullptr && cudaEventCreateWithFlags(&m.hand_out_ev[b], cudaEventDisableTiming) != cudaSuccess) got = false;
+            if (stage_lb_ > 0 && cudaEventCreateWithFlags(&m.stage_in_ev[b], cudaEventDisableTiming) != cudaSuccess) got = false;
+        }
+        float* bufs[3] = {};   // snap, stage_in[0], stage_in[1]
+        for (int i = 0; got && i < 3; ++i) {
+            if ((i == 0 && next_ == nullptr) || (i > 0 && stage_lb_ == 0)) continue;
+            if (cudaMalloc((void**) &bufs[i], one) != cudaSuccess) { bufs[i] = nullptr; got = false; }
+        }
+        if (got) {
+            for (float* p : bufs)
+                if (p != nullptr) m.owned.push_back(p);
+            m.snap = bufs[0];
+            m.stage_in[0] = bufs[1];
+            m.stage_in[1] = bufs[2];
+            m.stage_in_cap = stage_lb_ > 0 ? (int64_t) T : 0;
+            std::fprintf(stderr, "strata prefill: layer split, CUDA%d: overlapped hand-off copies (%.0f MiB of buffers)\n",
+                         m.device, (double) want / 1048576.0);
+        } else {
+            for (float* p : bufs)
+                if (p != nullptr) cudaFree(p);
+            (void) cudaGetLastError();   // a failed allocation's error is sticky for the next launch check
+            std::fprintf(stderr, "strata prefill: layer split, CUDA%d: hand-off copies on the compute stream (%.0f MiB "
+                                 "free, the overlapped ones need %.0f MiB + %.0f MiB kept free)\n", m.device,
+                         (double) fb / 1048576.0, (double) want / 1048576.0, (double) g_handoff_reserve / 1048576.0);
+        }
     }
     return true;
 }
@@ -1151,6 +1225,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
 
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_ring_override(int slots) { g_ring_override = slots > 0 ? slots : 0; }
+void Prefill::set_handoff_reserve(uint64_t bytes) { g_handoff_reserve = bytes; }
 double Prefill::pinned_share() { return g_pinned_share; }
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
@@ -1301,6 +1376,61 @@ struct PeTimer {
 };
 }  // namespace
 
+// ---- the layer split's pipeline (see the hand-off at the end of a chunk in `run`).  Both run on the thread that reads
+// the next stage's chunk, in chunk order: `hand_land` starts the rows' copy onto the next stage's device as soon as
+// they are in host memory - before that stage has finished the chunk before (its landing buffer for this chunk was
+// freed by the chunk two back, which has finished: the hand-off waited for it) - and `hand_run` runs the chunk there.
+bool Prefill::hand_land(int b, float* rows, void* landed, int64_t T) {
+    Impl& r = *next_->impl_;
+    if (r.stage_in[b] == nullptr || T > r.stage_in_cap) return false;
+    const core::OnDevice od(r.device);
+    if (landed != nullptr && cudaEventSynchronize((cudaEvent_t) landed) != cudaSuccess) return false;
+    if (cudaMemcpyAsync(r.stage_in[b], rows, (size_t) T * D * 4, cudaMemcpyHostToDevice, r.hand_cs) != cudaSuccess ||
+        cudaEventRecord(r.stage_in_ev[b], r.hand_cs) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+bool Prefill::hand_run(int b, bool staged, float* rows, void* landed, const int64_t* tokens, int64_t T, int64_t pos0) {
+    Impl& m = *impl_;
+    Impl& r = *next_->impl_;
+    if (!staged && landed != nullptr && cudaEventSynchronize((cudaEvent_t) landed) != cudaSuccess) {
+        m.down_err = std::string("prefill: the layer split's hand-off copy failed: ") +
+                     cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    next_->hand_in_ = rows;
+    next_->hand_dev_ = staged ? r.stage_in[b] : nullptr;
+    next_->hand_ev_ = staged ? (void*) r.stage_in_ev[b] : nullptr;
+    return next_->run(tokens, T, pos0, m.down_err);
+}
+
+bool Prefill::drain(std::string& err) {
+    Impl& m = *impl_;
+    bool ok = true;
+    for (int i = 0; i < 2; ++i) {
+        std::shared_future<bool>& f = m.down[(m.hand_next + i) % 2];   // the older one first
+        if (!f.valid()) continue;
+        if (!f.get() && ok) {
+            ok = false;
+            err = m.down_err.empty() ? "prefill: a later stage of the layer split failed" : m.down_err;
+        }
+        f = std::shared_future<bool>();
+    }
+    m.down_err.clear();
+    // every run of the next stage has returned: what it handed on in turn is all that can still be in flight
+    if (next_ != nullptr) {
+        std::string e;
+        if (!next_->drain(e) && ok) {
+            ok = false;
+            err = e;
+        }
+    }
+    return ok;
+}
+
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
     Impl& m = *impl_;
@@ -1309,11 +1439,19 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
-    // the next stage reads chunk c on a thread while this one reads chunk c + 1 (declared first: an early return
-    // waits for it before anything it reads goes away)
+    // the chunk this run reads in (set_run_chunk), at most the laid-out one
+    const int64_t TC = run_chunk_ > 0 ? std::min<int64_t>(run_chunk_, m.T) : m.T;
+    // STRATA_SPLIT_PIPELINE=0: the next stage reads chunk c on a thread while this one reads chunk c + 1 (declared
+    // first: an early return waits for it before anything it reads goes away).  The pipeline keeps its hand-offs in
+    // the Impl (m.down) instead, and the first stage drains them before its run returns - on an early return too
+    // (drain_guard), since the later stages' runs read `tokens` and their own buffers
     std::string next_err;
     std::future<bool> next_run;
     int hand_buf = 0;
+    struct Drain {
+        Prefill* p;
+        ~Drain() { if (p != nullptr) { std::string e; p->drain(e); } }
+    } drain_guard{LB == 0 && next_ != nullptr && split_pipeline() ? this : nullptr};
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
@@ -1342,8 +1480,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-    auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
-        const int64_t T = std::min(m.T, n - c0);
+    auto ple_gather = [&m, &ss, tokens, n, prev0, TC](int64_t c0, int buf, std::string& e) -> bool {
+        const int64_t T = std::min(TC, n - c0);
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
         for (int64_t t = 0; t < T; ++t) {
@@ -1359,10 +1497,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
-    for (int64_t c0 = 0; c0 < n; c0 += m.T) {
+    for (int64_t c0 = 0; c0 < n; c0 += TC) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
-        const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
+        const int64_t T = std::min(TC, n - c0), p0 = pos0 + c0;
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
@@ -1370,8 +1508,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
         // previous stage handed on
         if (hand_in_ != nullptr) {
-            if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
-                cudaSuccess) {
+            // the overlapped hand-off landed the rows on this device already (hand_land): a device copy once its
+            // event has completed; else the upload from the pinned host buffer, as before
+            const bool on_dev = hand_dev_ != nullptr;
+            if ((on_dev && cudaStreamWaitEvent(m.cs, (cudaEvent_t) hand_ev_, 0) != cudaSuccess) ||
+                cudaMemcpyAsync(m.R, (on_dev ? hand_dev_ : hand_in_) + (size_t) c0 * D, (size_t) T * D * 4,
+                                on_dev ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
                 err = "prefill: the layer split's hand-off upload failed";
                 return false;
             }
@@ -1444,13 +1586,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
-            if (c0 + m.T < n) {
+            if (c0 + TC < n) {
                 // the other buffer's upload (a chunk ago) is done before the SSD thread refills it
                 if (cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]) != cudaSuccess) {
                     err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
-                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
+                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + TC, b = ple_buf ^ 1] {
                     return ple_gather(c1, b, ple_next_err);
                 });
             }
@@ -2597,7 +2739,54 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
+        if (next_ != nullptr && split_pipeline()) {
+            // THE PIPELINE.  This stage hands chunk c on and goes on with chunk c + 1 at once; the next stage's runs
+            // follow one another on threads (each after the one before), and so do its own hand-offs, so every stage
+            // of the split reads its own chunk at the same time.  Until now a stage's run waited for the later stages
+            // to finish its chunk before it returned, so only the first stage ran beside the rest: a third card added
+            // its layers' time to the second's (5080 + 2080 Ti + 3090: prompts slower than 5080 + 3090).  Each stage's
+            // arithmetic and the order of its chunks are unchanged: the same output.
+            const int b = m.hand_next;
+            float* h = m.hand[b];
+            const size_t bytes = (size_t) T * D * 4;
+            const bool overlap = m.snap != nullptr;
+            // the snapshot on the device (its copy out for the previous chunk landed long ago, a chunk of work back)
+            if (overlap && ((m.snap_pending && cudaStreamWaitEvent(m.cs, m.hand_out_ev[b ^ 1], 0) != cudaSuccess) ||
+                            cudaMemcpyAsync(m.snap, m.R, bytes, cudaMemcpyDeviceToDevice, m.cs) != cudaSuccess)) {
+                err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            // hand[b] was read by the next stage's run two chunks ago: that run has finished before it is written
+            if (m.down[b].valid() && !m.down[b].get()) { err = m.down_err; return false; }
+            if ((!overlap && cudaMemcpyAsync(h, m.R, bytes, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess) ||
+                cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            // this stage's state is at the chunk's end now (synced) and moves on with the next chunk below
+            if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+            cudaEvent_t landed = nullptr;   // hand[b] holds the rows once it has completed (null: they are there)
+            if (overlap) {
+                if (cudaMemcpyAsync(h, m.snap, bytes, cudaMemcpyDeviceToHost, m.hand_cs) != cudaSuccess ||
+                    cudaEventRecord(m.hand_out_ev[b], m.hand_cs) != cudaSuccess) {
+                    err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                m.snap_pending = true;
+                landed = m.hand_out_ev[b];
+            }
+            const std::shared_future<bool> prev = m.down[b ^ 1];
+            const int64_t* tk = tokens + c0;
+            m.down[b] = std::async(std::launch::async, [this, prev, b, h, landed, tk, T, p0]() -> bool {
+                const bool staged = hand_land(b, h, (void*) landed, T);
+                if (prev.valid() && !prev.get()) return false;   // its previous chunk failed (m.down_err says why)
+                return hand_run(b, staged, h, (void*) landed, tk, T, p0);
+            }).share();
+            m.hand_next = b ^ 1;
+            continue;   // the last stage reports the chunk (on_chunk)
+        }
         if (next_ != nullptr) {
+            // STRATA_SPLIT_PIPELINE=0: the hand-off as before
             // the rows to the host buffer the next stage read two chunks ago (it has finished: waited below)
             float* h = m.hand[hand_buf];
             if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
@@ -2609,6 +2798,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
             next_->hand_in_ = h;
+            next_->hand_dev_ = nullptr;
+            next_->hand_ev_ = nullptr;
             next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err] {
                 return next_->run(tokens + c0, T, p0, next_err);
             });
@@ -2642,6 +2833,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         }
     }
     if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
+    // the pipeline: the first stage returns once every later stage has read every chunk (a later stage's run returns
+    // after its own chunk; the guard drains on an early return)
+    if (drain_guard.p != nullptr) {
+        drain_guard.p = nullptr;
+        if (!drain(err)) return false;
+    }
     ss.ple_prev[0] = prev[0];
     ss.ple_prev[1] = prev[1];
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
@@ -2654,7 +2851,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             for (float v : h) { c += !std::isfinite(v); if (std::isfinite(v)) mx = std::max(mx, (double) std::fabs(v)); }
             std::fprintf(stderr, " %lld non-finite (max |x| %.3g)", (long long) c, mx);
         };
-        const int64_t last = (n - 1) % m.T;
+        const int64_t last = (n - 1) % TC;
         std::fprintf(stderr, "strata dbg: prompt end: last residual row");
         bad(m.R + last * D, D);
         if (ss.ple.ready()) { std::fprintf(stderr, "; PLE history"); bad(ss.ple.hist, (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM); }

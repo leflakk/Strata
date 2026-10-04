@@ -179,9 +179,10 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamDestroy(cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
+    if (chain_ev_) cudaEventDestroy(chain_ev_);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_};
+                     h_flagA_, h_plan_, h_flagB_, h_rskip_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -359,19 +360,28 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
-        device_plan_ = v != nullptr && std::atoi(v) != 0;
+        device_plan_ = v != nullptr && std::atoi(v) != 0 && !resident_only_;
     }
-    if (device_plan_) {
+    if (device_plan_ || resident_only_) {
         bool ok2 = cudaMalloc((void**) &skip_, 64) == cudaSuccess && cudaMemset(skip_, 0, 64) == cudaSuccess;
         if (ok2 && hits.slot_off != nullptr && hits.n_slots > 0) {
             ok2 = cudaMalloc((void**) &slot_off_d_, (size_t) hits.n_slots * sizeof(unsigned long long)) == cudaSuccess &&
                   cudaMemcpy(slot_off_d_, hits.slot_off, (size_t) hits.n_slots * sizeof(unsigned long long),
                              cudaMemcpyHostToDevice) == cudaSuccess;
         }
-        if (!ok2) { cudaGetLastError(); device_plan_ = false; }
+        // resident-only: the plan's stamps (mapped: the host reads them after the window) and the chain's event
+        if (ok2 && resident_only_)
+            ok2 = mapped((size_t) (2 * g.n_layers + 2) * sizeof(uint32_t), (void**) &h_rskip_, (void**) &m_rskip_) &&
+                  cudaEventCreateWithFlags(&chain_ev_, cudaEventDisableTiming) == cudaSuccess;
+        if (!ok2) {
+            cudaGetLastError();
+            if (resident_only_) { err = "verify: the resident-only window's buffers failed"; return false; }
+            device_plan_ = false;
+        }
     }
-    std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
-                 (double) count.used / 1048576.0);
+    std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
+                 (double) count.used / 1048576.0,
+                 resident_only_ ? "; resident-only: every expert of its layers in VRAM, no host step per layer" : "");
     return true;
 }
 
@@ -686,13 +696,23 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
+        if (resident_only_) {
+            // every expert of this stage's layers has a slot: the group's plan on the device, nothing to the host (the
+            // plan stamps this layer's word with its ring, or 0 for a routed expert without a slot: resident_check)
+            const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
-                          plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
-                          (uint32_t) ((l - lb_) * G + grp + 1), cs);
-        doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
-                         m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+                          plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, m_rskip_ + (ring - 1),
+                          ring, cs);
+        } else {
+            if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
+                resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
+                              hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                              plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
+                              (uint32_t) ((l - lb_) * G + grp + 1), cs);
+            doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                             m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+        }
         stamp(l, 17, grp);
         {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
@@ -730,7 +750,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
-        if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
+        if (resident_only_) {
+            // the plan is in place: pre() built it on the device
+        } else if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
             wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
             copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
         } else {
@@ -764,6 +786,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         };
         grouped(p_ptr, p_start, p_counts, 0);
         stamp(l, 20, grp);
+        if (resident_only_) {
+            // no PCIe share and no CPU share: the rows are the hits alone (moe_hit_add below writes every one of them)
+            if (cudaMemsetAsync(parts_ + (size_t) tb * K * N, 0, (size_t) n * K * N * sizeof(float), cs) != cudaSuccess) {
+                err = "verify: the resident-only window's row reset failed";
+                return false;
+            }
+            stamp(l, 21, grp);
+            stamp(l, 22, grp);
+            stamp(l, 23, grp);
+        } else {
         if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
         else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
         if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
@@ -790,6 +822,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             else
                 copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
         }
+        }   // !resident_only_
         moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
@@ -1019,6 +1052,18 @@ bool Verifier::capture_commit(std::string& err) {
     return true;
 }
 
+bool Verifier::resident_check(std::string& err) {
+    const int G = groups_[last_t_] > 0 ? groups_[last_t_] : 1;
+    const int64_t steps = (le_ - lb_) * G;
+    for (int64_t k = 0; k < steps; ++k)
+        if (((volatile uint32_t*) h_rskip_)[k] != (uint32_t) (k + 1)) {
+            err = "verify: a routed expert of layer " + std::to_string((long long) (lb_ + k / G)) + " has no VRAM slot in "
+                  "a resident-only window (STRATA_RESIDENT_WINDOW=0 runs this stage with its host step)";
+            return false;
+        }
+    return true;
+}
+
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     using namespace strata::kernels;
@@ -1055,16 +1100,48 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (resident_only_) std::memset(h_rskip_, 0, (size_t) (2 * g.n_layers + 2) * sizeof(uint32_t));
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
+    if (wait_ev_ != nullptr) {   // a chained earlier stage: its window (and so its hand-off) first, on the GPU
+        const cudaEvent_t w = wait_ev_;
+        wait_ev_ = nullptr;
+        if (const cudaError_t we = cudaStreamWaitEvent(cs_, w, 0); we != cudaSuccess) {
+            err = std::string("verify: the wait for the previous stage: ") + cudaGetErrorString(we);
+            return false;
+        }
+    }
     VDBG("staged; launching\n");
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     VDBG("launched\n");
+    if (resident_only_) {
+        // RESIDENT-ONLY: the graph needs nothing from the host until it ends.  An earlier stage of a split does not
+        // wait for it either: the next stage's graph waits on the GPU (chain_ev_), and this window's own end is
+        // implied once the last stage's has been waited for.
+        resident_entries_ += (le_ - lb_) * (int64_t) T * (int64_t) ss.k;
+        static const bool chain_env = [] { const char* v = std::getenv("STRATA_STAGE_CHAIN"); return v == nullptr || v[0] != '0'; }();
+        if (le_ < g.n_layers && next_ != nullptr && chain_ && chain_env && !prof_on_) {
+            if (const cudaError_t re = cudaEventRecord(chain_ev_, cs_); re != cudaSuccess) {
+                err = std::string("verify: the stage chain's event: ") + cudaGetErrorString(re);
+                return false;
+            }
+            next_->wait_ev_ = chain_ev_;
+            ++windows;
+            if (!next_->run(T, tokens, pos0, pool, next_user_, out, err)) return false;
+            return resident_check(err);   // done: the next stage's graph could only start after this one
+        }
+        progress_at("verify window: waiting for the GPU to finish the window (resident-only)", (int64_t) T);
+        if (const cudaError_t se = cudaStreamSynchronize(cs_); se != cudaSuccess) {
+            err = std::string("verify: ") + cudaGetErrorString(se);
+            return false;
+        }
+        if (!resident_check(err)) return false;
+    } else {
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
@@ -1135,7 +1212,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
-    if (prof_on_ && G == 1) {       // the window's GPU stage stamps
+    }   // !resident_only_
+    if (prof_on_ && (groups_[T] > 0 ? groups_[T] : 1) == 1) {   // the window's GPU stage stamps
         cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
         const int64_t L = g.n_layers;
         auto at = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
@@ -1336,7 +1414,9 @@ bool Verifier::commit(int n_keep, std::string& err) {
     // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
     // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
     // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
-    if (!g_commit_async || next_ != nullptr) {
+    // a layer split's stages commit on their own streams (their next windows follow on them), so they no longer wait
+    // for one another either: wait_commit() walks the chain
+    if (!g_commit_async) {
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     } else {

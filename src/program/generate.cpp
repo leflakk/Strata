@@ -2289,7 +2289,9 @@ int main(int argc, char** argv) {
             }
         }
     }
-    strata::core::Verifier::set_commit_async(!multi_gpu);   // see Verifier::set_commit_async
+    // see Verifier::set_commit_async: a layer split's stages commit on their own streams without waiting for one another
+    // (wait_commit walks the chain); STRATA_SPLIT_COMMIT_SYNC=1 keeps a split's commits synchronous, as before
+    strata::core::Verifier::set_commit_async(!multi_gpu || std::getenv("STRATA_SPLIT_COMMIT_SYNC") == nullptr);
     // ---- layer split across GPUs: each later stage's own copy of the dense weights, its session and (the last) the
     // head, made on its device before the host arena is mapped (as the drafter below, for the same WDDM reason)
     std::vector<std::unique_ptr<GpuStage>> stages;
@@ -2553,6 +2555,77 @@ int main(int argc, char** argv) {
                                                     i == 0 ? 2 : at[(size_t) i - 1] + 1, L - (ns - 1 - i));
             }
             consider();
+        }
+        // ---- ALL ON THE GPUS: a placement where every stage holds every expert of its layers.  Then a decode window
+        // costs the same on all of them (no misses; the per-layer time of like cards), and a prompt runs at the pace of
+        // the pipeline's slowest stage - so among those placements the one whose slowest stage has the least work:
+        // layers x the card's per-layer time, the last stage's draft layer counted as STRATA_SPLIT_LAST_EXTRA (0.5)
+        // layer (it builds the drafter's K/V of every prompt chunk); then the most even one.  Exact for any number of
+        // cards: a partition of the layers into contiguous ranges by dynamic programming, the fit priced as `predict`
+        // prices it (the range's session out of the card's room, every expert of the range at its slot size).  Where no
+        // placement holds everything, the search above decides.  STRATA_SPLIT_BALANCE=0: the search above alone.
+        const bool balance_env = [] { const char* v = std::getenv("STRATA_SPLIT_BALANCE"); return v == nullptr || v[0] != '0'; }();
+        if (balance_env && (int64_t) profile.size() == g.n_layers * g.n_expert) {
+            const double last_extra = std::getenv("STRATA_SPLIT_LAST_EXTRA") ? std::atof(std::getenv("STRATA_SPLIT_LAST_EXTRA")) : 0.5;
+            const int64_t L = g.n_layers;
+            std::vector<int64_t> layer_bytes((size_t) L + 1, 0);   // prefix sums: every expert of layers [0, l)
+            for (int64_t l = 0; l < L; ++l) layer_bytes[(size_t) l + 1] = layer_bytes[(size_t) l] + g.n_expert * cost(l);
+            auto fits = [&](int i, int64_t lb, int64_t le) {
+                const int64_t room = cap[(size_t) i] - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le);
+                return layer_bytes[(size_t) le] - layer_bytes[(size_t) lb] <= room;
+            };
+            auto work = [&](int i, int64_t lb, int64_t le) {
+                return ((double) (le - lb) + (i + 1 == ns ? last_extra : 0.0)) * layer_ms[(size_t) i];
+            };
+            constexpr double kNone = 1e300;
+            // pass 1: the least possible work of the slowest stage; pass 2: the most even placement within it (the
+            // sum of the stages' squared work, additive, so the same recursion is exact)
+            std::vector<double> f((size_t) (ns * (L + 1)), kNone);
+            std::vector<int64_t> from((size_t) (ns * (L + 1)), -1);
+            auto at_ = [&](int i, int64_t l) { return (size_t) i * (size_t) (L + 1) + (size_t) l; };
+            auto solve = [&](double cap_work) -> double {   // cap_work < 0: pass 1 (minimize the max)
+                std::fill(f.begin(), f.end(), kNone);
+                std::fill(from.begin(), from.end(), -1);
+                for (int64_t le = 2; le <= L - (ns - 1); ++le)   // the first stage holds layers 0 and 1 (the PLE block)
+                    if (fits(0, 0, le) && (cap_work < 0 || work(0, 0, le) <= cap_work)) {
+                        const double w = work(0, 0, le);
+                        f[at_(0, le)] = cap_work < 0 ? w : w * w;
+                    }
+                for (int i = 1; i < ns; ++i)
+                    for (int64_t le = 2 + i; le <= L - (ns - 1 - i); ++le) {
+                        if (i + 1 == ns && le != L) continue;
+                        for (int64_t lb = 1 + i; lb < le; ++lb) {
+                            const double prev = f[at_(i - 1, lb)];
+                            if (prev >= kNone || !fits(i, lb, le)) continue;
+                            const double w = work(i, lb, le);
+                            if (cap_work >= 0 && w > cap_work) continue;
+                            const double v = cap_work < 0 ? std::max(prev, w) : prev + w * w;
+                            if (v < f[at_(i, le)]) { f[at_(i, le)] = v; from[at_(i, le)] = lb; }
+                        }
+                    }
+                return f[at_(ns - 1, L)];
+            };
+            const double worst = solve(-1.0);
+            if (worst < kNone && solve(worst * (1.0 + 1e-9)) < kNone) {
+                std::vector<int64_t> cut((size_t) ns - 1);
+                int64_t le = L;
+                for (int i = ns - 1; i >= 1; --i) {
+                    const int64_t lb = from[at_(i, le)];
+                    cut[(size_t) i - 1] = lb;
+                    le = lb;
+                }
+                double hm = 0;
+                int64_t held = 0;
+                const double ms = predict(cut, hm, held);
+                if (hm >= best_mass - 1e-12) {   // every pair held: at least what the search above held
+                    best = cut;
+                    best_ms = ms;
+                    best_mass = hm;
+                    best_held = held;
+                    std::fprintf(stderr, "strata generate: layer split auto: every stage holds all the experts of its "
+                                         "layers; balanced for prompts (the slowest stage %.2f ms of layer work)\n", worst);
+                }
+            }
         }
         split_at = best;
         std::string ks;
@@ -4186,7 +4259,7 @@ int main(int argc, char** argv) {
                 }
                 return 0;
             };
-            const int64_t chunk = pick(nullptr);
+            int64_t chunk = pick(nullptr);
             // #448: a small card in a layer split caps every stage's chunk (an RTX 3080's 512-slot cache held a
             // 32 GB card's split to 512 tokens: prompts 6.2x slower, decode the same).  Named when it bites, so the
             // regression is one log line: each stage that cannot fund the chunk CUDA0 alone would read in.
@@ -4215,6 +4288,37 @@ int main(int argc, char** argv) {
                                              "instead of a split stage: without --layer-split, with %s "
                                              "(docs/SECOND_GPU.md)\n",
                                      dev == 1 ? "--expert-cache-device1 N" : "--expert-cache-device1..3 N, in order");
+                    }
+                }
+            }
+            // ALL ON THE GPUS: when every stage holds all the experts of its layers, a loan would stream the lent ones
+            // during every prompt chunk (and keep its windows from running resident-only): with --prefill auto, the
+            // largest chunk (from 1024 up) whose buffers every stage can keep as its own, by the #340 rule below (the
+            // buffers + 1.5 GiB free), wins over a larger lent one - the pipeline cuts prompts smaller anyway.
+            // STRATA_SPLIT_OWN_FIRST=0: the chunk as picked.
+            static const bool own_first = [] { const char* v = std::getenv("STRATA_SPLIT_OWN_FIRST"); return v == nullptr || v[0] != '0'; }();
+            if (chunk > 0 && o.prefill_auto && own_first && pf_parts.size() > 1 && !host_res.empty() &&
+                std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; })) {
+                for (const int64_t c : kAutoChunks) {
+                    if (c > chunk) continue;
+                    if (c < 1024) break;
+                    bool all_own = true;
+                    for (const PfPart& p : pf_parts) {
+                        const strata::core::OnDevice on(p.dev);
+                        size_t fb = 0, tb = 0;
+                        if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); all_own = false; break; }
+                        if ((uint64_t) fb < strata::prefill::Prefill::bytes_needed(g, *p.ses, c) + (3ull << 29)) {
+                            all_own = false;
+                            break;
+                        }
+                    }
+                    if (all_own) {
+                        if (c != chunk)
+                            std::fprintf(stderr, "strata serve: layer split, every expert resident: %lld-token prompt chunks "
+                                                 "so every stage keeps its own buffers (not %lld lent)\n",
+                                         (long long) c, (long long) chunk);
+                        chunk = c;
+                        break;
                     }
                 }
             }
@@ -4294,6 +4398,9 @@ int main(int argc, char** argv) {
         // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned (#253) a
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
+        // a split's overlapped hand-off buffers (Prefill::init) only where the card keeps the VRAM reserve and 1 GiB
+        // more free after them: the verify windows, the draft head and the BLAS workspaces are allocated after this
+        strata::prefill::Prefill::set_handoff_reserve(((uint64_t) std::max(0, o.vram_reserve_mib) << 20) + (1ull << 30));
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
@@ -4439,6 +4546,37 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // ---- THE LAYER SPLIT'S PIPELINE CHUNK, per request.  The stages read a prompt as a pipeline: S stages take a
+        // C-chunk prompt in C + S - 1 steps of one chunk on one stage, so few big chunks leave most stages idle while
+        // the pipeline fills and drains (a 32K prompt in 8192-token chunks keeps eight cards busy 4 of 11 steps).  A
+        // smaller chunk costs every GEMM some efficiency, modelled as alpha / B per token; B = sqrt(alpha P / (S - 1))
+        // minimizes (P + (S - 1) B)(1 + alpha / B).  Rounded down to 256 tokens, at least STRATA_PIPE_MIN (1024), at
+        // most the laid-out chunk.  Only when no stage streams an expert during a prompt (every expert resident, no
+        // stage borrowing cache slots): there a smaller chunk would stream the same experts more often.
+        // STRATA_PIPE_ALPHA tunes alpha (900); 0 turns this off (the laid-out chunk, as before).
+        bool pipe_resident = multi_gpu && !host_res.empty() && split_small == 0;
+        for (size_t i = 0; pipe_resident && i < host_res.size(); ++i) pipe_resident = host_res[i] >= 0;
+        for (const PfPart& p : pf_parts) pipe_resident = pipe_resident && p.first < 0;
+        const double pipe_alpha = [] {
+            const char* v = std::getenv("STRATA_PIPE_ALPHA");
+            return v ? std::max(0.0, std::atof(v)) : 900.0;
+        }();
+        const int64_t pipe_min = [] {
+            const char* v = std::getenv("STRATA_PIPE_MIN");
+            return v ? std::max<int64_t>(256, std::atoll(v)) : (int64_t) 1024;
+        }();
+        auto pipe_chunk = [&](int64_t tokens) -> int64_t {   // 0: the laid-out chunk
+            const int64_t S = (int64_t) stages.size() + 1;
+            if (!pipe_resident || pipe_alpha <= 0.0 || S < 2 || tokens <= pipe_min) return 0;
+            const double b = std::sqrt(pipe_alpha * (double) tokens / (double) (S - 1));
+            const int64_t c = std::max<int64_t>(pipe_min, ((int64_t) b / 256) * 256);
+            return c < sp.chunk() ? c : 0;
+        };
+        if (pipe_resident && pipe_alpha > 0.0)
+            std::fprintf(stderr, "strata serve: layer split: every expert resident, no loans: prompts read in pipeline "
+                                 "chunks (32K tokens: %lld, 128K: %lld; laid out for %lld)\n",
+                         (long long) (pipe_chunk(32768) ? pipe_chunk(32768) : sp.chunk()),
+                         (long long) (pipe_chunk(131072) ? pipe_chunk(131072) : sp.chunk()), (long long) sp.chunk());
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
@@ -4469,6 +4607,39 @@ int main(int argc, char** argv) {
         };
         auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
+        // ---- RESIDENT-ONLY VERIFY WINDOWS (Verifier::set_resident_only), per stage: every expert of the stage's layers
+        // has a slot in its cache (the profile fill held them all) and nothing takes one away - the stage's prompt path
+        // keeps its own buffers instead of borrowing slots, and no helper or peer cache is in play.  Its windows then
+        // plan the experts on the GPU and never wait for the host between layers (the doorbell, the pool's plan, the
+        // flags: ~8 small kernels and a host round trip per layer).  The same rows: every expert was a hit already.
+        // One GPU that holds the whole model takes it too.  STRATA_RESIDENT_WINDOW=0: the host step everywhere.
+        {
+            const bool env_on = [] { const char* v = std::getenv("STRATA_RESIDENT_WINDOW"); return v == nullptr || v[0] != '0'; }();
+            std::string on_s, off_s;
+            for (int st = 0; st < n_stages; ++st) {
+                const int64_t lb = st == 0 ? 0 : split_at[(size_t) st - 1];
+                const int64_t le = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
+                const int dev = st == 0 ? 0 : split_same ? 0 : stages[(size_t) st - 1]->dev;
+                std::string why;
+                if (!env_on) why = "STRATA_RESIDENT_WINDOW=0";
+                else if (split_same) why = "--split-device 0";
+                else if (host_res.empty() || remote_caches || peer.valid()) why = "no static residency table";
+                else if ((size_t) st < pf_parts.size() && pf_parts[(size_t) st].first >= 0) why = "its prompt path borrows cache slots";
+                else {
+                    int64_t missing = 0;
+                    for (int64_t l = lb; l < le; ++l)
+                        for (int64_t e = 0; e < g.n_expert; ++e) missing += host_res[(size_t) (l * g.n_expert + e)] < 0;
+                    if (missing > 0) why = std::to_string((long long) missing) + " experts of its layers not in VRAM";
+                }
+                stage_ver(st).set_resident_only(why.empty());
+                std::string& s = why.empty() ? on_s : off_s;
+                s += (s.empty() ? "" : ", ") + ("CUDA" + std::to_string(dev)) + (why.empty() ? "" : " (" + why + ")");
+            }
+            if (!on_s.empty())
+                std::fprintf(stderr, "strata serve: resident-only verify windows (no host step per layer) on %s\n", on_s.c_str());
+            if (!off_s.empty() && env_on)
+                std::fprintf(stderr, "strata serve: verify windows with the host step per layer on %s\n", off_s.c_str());
+        }
         if (n_stages > 1) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
@@ -4686,8 +4857,16 @@ int main(int argc, char** argv) {
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
-            // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
-            const bool batched = !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
+            // E-9: batched through the prompt path when it can - the one on the drafter's device: CUDA0's, or a layer
+            // split's last stage, which this runs on.  The split used to take the drafter's own pass here (a graph per
+            // window-sized group of rows, ~2,000 per 8192-token chunk) on the stage every other one then waited for.
+            // STRATA_SPLIT_MTP_BATCH=0: the drafter's own pass on a split (the A/B).
+            static const bool split_kv_batch = [] {
+                const char* v = std::getenv("STRATA_SPLIT_MTP_BATCH");
+                return v == nullptr || v[0] != '0';
+            }();
+            strata::prefill::Prefill& kv_sp = multi_gpu ? stages.back()->sp : sp;
+            const bool batched = (!multi_gpu || split_kv_batch) && kv_sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
             if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
             if (std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
@@ -5623,6 +5802,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 const auto tsp = Clock::now();
+                if (!win) sp.set_run_chunk(pipe_chunk(to - at));   // a layer split's pipeline chunk (0: as laid out)
                 const bool sp_ok = win ? read_windows(at, to, err) : sp.run(ids.data() + at, to - at, at, err);
                 if (trace) {
                     std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
@@ -5694,6 +5874,7 @@ int main(int argc, char** argv) {
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
+            const int64_t resident0 = ver.resident_entries_all();   // the resident-only windows' entries (all hits)
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
             const uint64_t file_bytes0 = src.file_read_bytes();
@@ -5823,8 +6004,14 @@ int main(int argc, char** argv) {
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
-                const std::string pr = ver.profile_report();
-                if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());
+                for (int st = 0; st < n_stages; ++st) {   // a layer split: every stage's own table
+                    const std::string pr = stage_ver(st).profile_report();
+                    if (pr.empty()) continue;
+                    if (n_stages > 1)
+                        std::fprintf(stderr, "strata decode GPU stages, stage %d (ms/window):%s\n", st, pr.c_str());
+                    else
+                        std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());
+                }
             }
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
@@ -5943,8 +6130,10 @@ int main(int argc, char** argv) {
                              (unsigned long long) h_stale, (unsigned long long) h_dead,
                              (unsigned long long) h_pool_full, ss.ple_prev[0], ss.ple_prev[1]);
             }
-            const int64_t req_hits = drive.d.cache_hits - decode_hits0;
-            const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0;
+            const int64_t req_resident = ver.resident_entries_all() - resident0;
+            const int64_t req_hits = drive.d.cache_hits - decode_hits0 + req_resident;
+            const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0 +
+                                     req_resident;
             // #471: the prompt tokens this request read - all the fresh ones, or as far as the prompt pass got when a
             // cancel stopped it part-way (a cancelled request used to be logged and counted as having read them all)
             const int64_t fresh = n - resume;

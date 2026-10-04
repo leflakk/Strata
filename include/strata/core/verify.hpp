@@ -114,6 +114,21 @@ public:
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    /// RESIDENT-ONLY WINDOWS: every expert of this verifier's layers has a VRAM slot for good (a static residency
+    /// table covering them all; nothing lends or swaps them away).  The window then plans each layer's experts on
+    /// the device and captures no doorbell, no spin-wait on a host flag and no CPU or PCIe share: one graph the GPU
+    /// runs to its end with no host step per layer, and `run` no longer calls the pool for these layers.  The
+    /// arithmetic of every row is the hit path's, as before.  A routed expert without a slot (which this promise
+    /// rules out) fails the window instead of computing it wrong.  Set before `init`.
+    void set_resident_only(bool on) { resident_only_ = on; }
+    bool resident_only() const { return resident_only_; }
+    /// Layer split: a resident-only stage does not wait for its window on the host; the next stage's graph waits
+    /// for it on the GPU (an event), and only the last stage's end is waited for.  Default on (STRATA_STAGE_CHAIN=0:
+    /// off).  Set before the first `run`.
+    void set_chain(bool on) { chain_ = on; }
+    /// Routed (token, expert) entries served by resident-only windows, this stage and the later ones together (the
+    /// pool counts the others).
+    int64_t resident_entries_all() const { return resident_entries_ + (next_ ? next_->resident_entries_all() : 0); }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
@@ -181,6 +196,14 @@ private:
     float* hand_out_ = nullptr;
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
+    bool resident_only_ = false;         ///< set_resident_only
+    bool chain_ = true;                  ///< set_chain
+    int64_t resident_entries_ = 0;       ///< resident_entries_all: this stage's share
+    cudaEvent_t chain_ev_ = nullptr;     ///< recorded after this stage's window when it chains to the next
+    cudaEvent_t wait_ev_ = nullptr;      ///< set by the previous stage: this window's graph waits for it first
+    uint32_t* h_rskip_ = nullptr;        ///< resident-only: one word per (layer, group) the device plan stamps with
+    uint32_t* m_rskip_ = nullptr;        ///< its ring, 0 when a routed expert had no slot (mapped; read after the window)
+    bool resident_check(std::string& err);   ///< after a resident-only window: every layer's plan was whole
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);

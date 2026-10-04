@@ -84,6 +84,52 @@ strata generate: layer split auto: K=19 - the caches hold 11767 of 12288 profile
 strata serve: layer split: layers 0-18 (CUDA0), 19-47 (CUDA1), one hand-off per window
 ```
 
+## The whole model on the GPUs (three or more cards)
+
+When the cards together hold every expert of the model (the startup log's `expert cache ... N of its N profiled
+pairs` on every card says so; with 24 GB cards, the 2-3-bit models on three or four of them, UD-Q4_K_XL on six or
+more), the split behaves as a pipeline of GPUs and nothing else: the CPU computes no expert, nothing streams over
+PCIe while a prompt is read, and the decode window needs no host step between layers. What the engine does in that
+case (each part has a switch for A/B runs; the defaults are on):
+
+- **Balanced layers** (`--layer-split auto`): among the placements where every card holds all the experts of its
+  layers, the one whose slowest card has the least work - layers times the card's speed, the last card's draft layer
+  counted as half a layer (`STRATA_SPLIT_LAST_EXTRA`) - then the most even one. Any number of cards, not only two or
+  three. The log says `every stage holds all the experts of its layers; balanced for prompts`.
+  `STRATA_SPLIT_BALANCE=0`: the placement search alone.
+- **A real prompt pipeline**: every card reads its own chunk at the same time. Until now a card handed a chunk on and
+  waited for all the later cards to finish it, so only the first card ran beside the rest: with three or more cards
+  the later ones took turns. `STRATA_SPLIT_PIPELINE=0`: the old hand-off.
+- **Hand-offs beside the work**: a card copies a chunk's rows (80 MiB per 2048 tokens) to the next one on a copy
+  stream while it reads the next chunk, and the next card receives them while it still reads the chunk before - where
+  each card has the VRAM for the buffers (one chunk on a card that hands on, two on one that receives, with the VRAM
+  reserve and 1 GiB more left free). The log says `overlapped hand-off copies` or why not. Slow links (x4 or x1
+  slots, risers) gain the most. `STRATA_SPLIT_HANDOFF=sync`: the copies on the compute stream, as before.
+- **Pipeline chunks**: a prompt is cut into more, smaller chunks so the cards fill up sooner: about
+  sqrt(900 x tokens / (cards - 1)) tokens, at least 1024 (`STRATA_PIPE_ALPHA`, `STRATA_PIPE_MIN`; 0 turns it off).
+  Only when no card lends cache slots to its prompt path (a lent slot's expert would stream once per chunk).
+- **The draft layer's prompt K/V in batches** on the last card, through its prompt path (as one GPU does), instead of
+  the drafter's own pass of a few rows at a time. `STRATA_SPLIT_MTP_BATCH=0`: the drafter's own pass.
+- **Resident-only verify windows**: a card that holds every expert of its layers (and lends none of its cache to the
+  prompt path) plans each layer's experts on the GPU and runs its part of the window as one graph with no host step;
+  the next card's graph waits for it on the GPU, not through the host. One card that holds a whole model does the
+  same. The log says `resident-only verify windows (no host step per layer) on CUDA0, ...`. `STRATA_RESIDENT_WINDOW=0`:
+  the host step on every card; `STRATA_STAGE_CHAIN=0`: each card waited for by the host.
+- **Commits without waiting**: after a window every card commits its state on its own stream; the next window follows
+  on the same streams. `STRATA_SPLIT_COMMIT_SYNC=1`: each card's commit waited for, as before.
+
+None of these changes the arithmetic of a token: the same rows are computed by the same kernels (the pipeline chunk
+can change which GEMM a prompt chunk takes, as `--prefill auto` already does per request).
+
+`tools/multi_gpu_bench.py` measures a configuration: prompt and decode speed at given lengths through the engine's own
+numbers, and the generated tokens for an A/B comparison:
+
+```
+python tools/multi_gpu_bench.py strata-iq3_s.json --gpus all --lengths 4096,32768,131072 --tokens-out new.json
+python tools/multi_gpu_bench.py strata-iq3_s.json --gpus all --env STRATA_RESIDENT_WINDOW=0 --tokens-out old.json
+python tools/multi_gpu_bench.py --compare new.json old.json
+```
+
 ## What each card holds
 
 - **every card**: a copy of the dense weights (~3.4 GB for the Coder), its own session state (the KV cache of the full
