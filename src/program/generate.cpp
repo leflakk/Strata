@@ -4624,6 +4624,7 @@ int main(int argc, char** argv) {
                 if (!env_on) why = "STRATA_RESIDENT_WINDOW=0";
                 else if (split_same) why = "--split-device 0";
                 else if (host_res.empty() || remote_caches || peer.valid()) why = "no static residency table";
+                else if (drive.routing != nullptr) why = "--dump-routing records every layer's routing on the host";
                 else if ((size_t) st < pf_parts.size() && pf_parts[(size_t) st].first >= 0) why = "its prompt path borrows cache slots";
                 else {
                     int64_t missing = 0;
