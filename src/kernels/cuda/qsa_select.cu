@@ -607,6 +607,7 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
 // contiguous blocks, as before.  The selection rule is block_topk_kernel's (radix threshold, ties to the lowest index,
 // cells ascending): identical ids.  CUDA (sm_70+: __match_any_sync); HIP keeps block_topk_kernel.
 constexpr int TW_T = 1024;   // block_excl_scan's 32 warps
+constexpr int TW_UNR = 4;    // score loads in flight per thread in a radix pass
 __global__ void __launch_bounds__(TW_T) block_topk_wide_kernel(const float* __restrict__ scores,
                                                                const int32_t* __restrict__ steps, int64_t max_blocks,
                                                                int64_t cap, int32_t* __restrict__ ids) {
@@ -632,16 +633,27 @@ __global__ void __launch_bounds__(TW_T) block_topk_wide_kernel(const float* __re
         for (int i = lane; i < 256; i += 32) hist[warp][i] = 0;
         __syncwarp();
         const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
-        // every lane of a warp runs every iteration (the match takes them all); block b = base + t, coalesced
-        for (int64_t base = 0; base < nb; base += TW_T) {
-            const int64_t b = base + t;
-            const uint32_t k = b < nb ? order_key(sc[b]) : 0u;
-            const bool match = b < nb && (k & hi_mask) == (prefix & hi_mask);
-            const unsigned d = (k >> shift) & 255u;
-            const bool full = match && b < n_bid;      // R cells; the last block adds its own count below
-            const unsigned grp = __match_any_sync(0xffffffffu, full ? d : 256u + (unsigned) lane);
-            if (full && lane == __ffs(grp) - 1) atomicAdd(&hist[warp][d], R * __popc(grp));
-            if (match && b == n_bid && w_last > 0) atomicAdd(&hist[warp][d], w_last);
+        // every lane of a warp runs every iteration (the match takes them all); block b = base + u * TW_T + t,
+        // coalesced, TW_UNR loads in flight per thread before any is used (one at a time left the passes L2-latency
+        // bound)
+        for (int64_t base = 0; base < nb; base += (int64_t) TW_T * TW_UNR) {
+            uint32_t kk[TW_UNR];
+#pragma unroll
+            for (int u = 0; u < TW_UNR; ++u) {
+                const int64_t b = base + (int64_t) u * TW_T + t;
+                kk[u] = b < nb ? order_key(sc[b]) : 0u;
+            }
+#pragma unroll
+            for (int u = 0; u < TW_UNR; ++u) {
+                const int64_t b = base + (int64_t) u * TW_T + t;
+                const uint32_t k = kk[u];
+                const bool match = b < nb && (k & hi_mask) == (prefix & hi_mask);
+                const unsigned d = (k >> shift) & 255u;
+                const bool full = match && b < n_bid;  // R cells; the last block adds its own count below
+                const unsigned grp = __match_any_sync(0xffffffffu, full ? d : 256u + (unsigned) lane);
+                if (full && lane == __ffs(grp) - 1) atomicAdd(&hist[warp][d], R * __popc(grp));
+                if (match && b == n_bid && w_last > 0) atomicAdd(&hist[warp][d], w_last);
+            }
         }
         __syncthreads();
         if (t < 256) {                                 // fold the warps' histograms into warp 0's
