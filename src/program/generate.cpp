@@ -73,6 +73,9 @@
 #endif
 
 #include <cuda_runtime.h>
+#if !defined(STRATA_USE_HIP)
+#include <cuda_profiler_api.h>
+#endif
 
 #include <array>
 #include <chrono>
@@ -101,6 +104,45 @@
 #include <vector>
 
 namespace {
+// STRATA_CUDA_PROFILE=<context>:<windows> (diagnostics, for `nsys profile --capture-range=cudaProfilerApi`): the CUDA
+// profiler runs from the first decode window at or past <context> cells for <windows> whole rounds (verify, draft),
+// once per process.  Unset: nothing is called.
+struct CudaProfileRange {
+    long long at = -1;
+    int left = 0;
+    bool on = false;
+    CudaProfileRange() {
+        if (const char* v = std::getenv("STRATA_CUDA_PROFILE")) {
+            long long c = 0;
+            int w = 0;
+            if (std::sscanf(v, "%lld:%d", &c, &w) == 2 && c >= 0 && w > 0) {
+                at = c;
+                left = w;
+            }
+        }
+    }
+    void window(long long pos) {   // at the start of every decode window
+        if (at < 0) return;
+        if (!on) {
+            if (pos < at) return;
+#if !defined(STRATA_USE_HIP)
+            cudaProfilerStart();
+#endif
+            on = true;
+            std::fprintf(stderr, "strata: CUDA profiler on at %lld cells for %d windows (STRATA_CUDA_PROFILE)\n", pos,
+                         left);
+            return;
+        }
+        if (--left > 0) return;
+#if !defined(STRATA_USE_HIP)
+        cudaProfilerStop();
+#endif
+        on = false;
+        at = -1;
+        std::fprintf(stderr, "strata: CUDA profiler off (STRATA_CUDA_PROFILE)\n");
+    }
+};
+
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
 // a Linux driver has no such limit (#253: the 8 GiB cap cost a 4090 + 3060 split 3x of its prompt speed).
@@ -5216,6 +5258,7 @@ int main(int argc, char** argv) {
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
         if (S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        CudaProfileRange cuda_profile;   // STRATA_CUDA_PROFILE (diagnostics): nothing without it
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
@@ -5925,6 +5968,7 @@ int main(int argc, char** argv) {
                                cudaMemcpyHostToDevice);
                 }
                 tr("window", p, T);
+                cuda_profile.window(p);
                 const Clock::time_point tw0 = Clock::now();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());

@@ -12,6 +12,8 @@ whatever their --label, so their tokens can be compared.
     python tools/multi_gpu_bench.py strata-iq3_s.json --gpus all --tokens-out a.json      # the generated ids too
     python tools/multi_gpu_bench.py strata-iq3_s.json --gpus all --set "--ple-io ram" --set --mmap-experts
     python tools/multi_gpu_bench.py --compare a.json b.json                             # same tokens? (greedy A/B)
+    python tools/multi_gpu_bench.py strata-iq3_s.json --lengths 250000 --repeats 1 --env STRATA_CUDA_PROFILE=240000:40 \
+        --wrap "nsys profile -o decode250k -f true -t cuda --cuda-graph-trace=node --capture-range=cudaProfilerApi --capture-range-end=stop"
 
 One JSON line per request goes to --out (appended), a table to the terminal.  Greedy decoding (temperature 0) unless
 --temperature is given.
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import statistics
 import subprocess
 import sys
@@ -115,6 +118,8 @@ def main() -> int:
     ap.add_argument("--out", default="multi_gpu_bench.jsonl", help="JSON lines appended here")
     ap.add_argument("--tokens-out", help="the generated ids of every request, as JSON (for --compare)")
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"), help="compare two --tokens-out files and exit")
+    ap.add_argument("--wrap", help='run the engine under this command (a profiler: "nsys profile -o x ..."); the '
+                                   'engine and its arguments follow it')
     # `--set --mmap-experts` (a value that starts with "--") is taken as --set=--mmap-experts
     argv, i = [], 0
     raw = sys.argv[1:]
@@ -157,8 +162,15 @@ def main() -> int:
     print(f"[{label}] engine args: {' '.join(args)}")
     if cfg["env"]:
         print(f"[{label}] env: {cfg['env']}")
+    exe = cfg["exe"]
+    if a.wrap:   # a small script, so the engine's own command line (`exe --serve args`) stays as the server builds it
+        wrapper = Path(a.out).resolve().with_suffix(".wrap.sh")
+        wrapper.write_text(f"#!/bin/sh\nexec {a.wrap} {shlex.quote(str(Path(exe).resolve()))} \"$@\"\n")
+        wrapper.chmod(0o755)
+        exe = str(wrapper)
+        print(f"[{label}] engine wrapped: {a.wrap}")
     t0 = time.time()
-    eng = StrataEngine(cfg["exe"], args, cwd=cfg.get("cwd"), log=cfg.get("log"), env=child_env(cfg))
+    eng = StrataEngine(exe, args, cwd=cfg.get("cwd"), log=cfg.get("log"), env=child_env(cfg))
     if not eng.alive():
         print(f"[{label}] the engine did not start; its log: {cfg.get('log')}")
         return 1
