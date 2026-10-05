@@ -1,9 +1,9 @@
 """Prompt and decode speed of one engine configuration, measured through the engine's own protocol.
 
 Starts the engine a setup config describes (strata-*.json), optionally on other GPUs, with a layer split, extra engine
-arguments or environment switches, then sends prompts of the given lengths (built from this repository's source, so
-any PC can rebuild the same ones) and reads the engine's own DONE numbers: prompt tokens read and the time it took,
-tokens generated and the time it took.  Every request starts with its own line (--tag, the length, the repeat), so no
+arguments or environment switches, then sends prompts of the given lengths (built from this repository's source as it
+was at commit --corpus-rev, so any PC, and any later version of the code, rebuilds the same ones) and reads the
+engine's own DONE numbers: prompt tokens read and the time it took, tokens generated and the time it took.  Every request starts with its own line (--tag, the length, the repeat), so no
 conversation checkpoint is reused and every prompt is read in full; runs with the same --tag read the same prompts
 whatever their --label, so their tokens can be compared.
 
@@ -21,6 +21,7 @@ One JSON line per request goes to --out (appended), a table to the terminal.  Gr
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import shlex
 import statistics
@@ -28,13 +29,16 @@ import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 
 CORPUS_GLOBS = ("src/**/*.cpp", "src/**/*.cu", "include/**/*.hpp", "serve/*.py", "tools/*.py", "docs/*.md")
+# the prompts' text: these files as they were at this commit (multi-3090 round 5), read through git - editing the source
+# no longer changes the prompts, so the tokens of runs on different versions of the code can be compared
+CORPUS_REV = "14ae6c9"
 CHAT_PREFIX = "<|im_start|>user\nRun {tag}. Read this source code, then summarize what it does in five bullet points.\n\n"
 CHAT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
@@ -49,17 +53,55 @@ def load_tokenizer(path: Path):
                         json.loads((path / "token_type.json").read_text()))
 
 
-def corpus_ids(tok, need: int) -> list[int]:
+def corpus_files(rev: str | None) -> list[tuple[str, str]]:
+    """(path, text) of the CORPUS_GLOBS files in a fixed order: the working tree's (rev None), or commit `rev`'s read
+    through git - the files, order and text the working tree had at that commit (Path.glob's matches, Path order,
+    read_text's newlines)."""
+    if rev is None:
+        files = sorted({p for g in CORPUS_GLOBS for p in ROOT.glob(g) if p.is_file()})
+        return [(p.relative_to(ROOT).as_posix(), p.read_text(encoding="utf-8", errors="replace")) for p in files]
+    names = subprocess.run(["git", "-C", str(ROOT), "ls-tree", "-r", "--name-only", rev], capture_output=True,
+                           text=True, check=True).stdout.splitlines()
+
+    def matches(path: str, glob: str) -> bool:   # "d/**/*.x": under d at any depth; "d/*.x": directly in d
+        top, _, rest = glob.partition("/")
+        if not path.startswith(top + "/"):
+            return False
+        name = path.rsplit("/", 1)[1]
+        if rest.startswith("**/"):
+            return fnmatch.fnmatchcase(name, rest[3:])
+        return path.count("/") == 1 and fnmatch.fnmatchcase(name, rest)
+
+    paths = sorted({PurePosixPath(n) for n in names if any(matches(n, g) for g in CORPUS_GLOBS)})
+    batch = subprocess.run(["git", "-C", str(ROOT), "cat-file", "--batch"], capture_output=True, check=True,
+                           input="".join(f"{rev}:{p.as_posix()}\n" for p in paths).encode()).stdout
+    out, at = [], 0
+    for p in paths:
+        head_end = batch.index(b"\n", at)
+        size = int(batch[at:head_end].split()[2])
+        body = batch[head_end + 1:head_end + 1 + size]
+        at = head_end + 1 + size + 1
+        text = body.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+        out.append((p.as_posix(), text))
+    return out
+
+
+def corpus_ids(tok, need: int, rev: str | None = CORPUS_REV) -> list[int]:
     """At least `need` token ids of this repository's source, in a fixed file order (cut later)."""
     ids: list[int] = []
-    files = sorted({p for g in CORPUS_GLOBS for p in ROOT.glob(g) if p.is_file()})
+    try:
+        files = corpus_files(rev)
+    except (OSError, subprocess.CalledProcessError, ValueError, IndexError) as e:
+        print(f"the prompts' source at commit {rev} cannot be read ({e}): the working tree's files instead - their "
+              "prompts, and so their tokens, differ from other versions' runs")
+        files = corpus_files(None)
+    if not files:
+        raise SystemExit("no source files found for the prompts")
     while len(ids) < need:
-        for p in files:
-            ids += tok.encode(f"\n\n// ---- {p.relative_to(ROOT).as_posix()}\n" + p.read_text(encoding="utf-8", errors="replace"))
+        for path, text in files:
+            ids += tok.encode(f"\n\n// ---- {path}\n" + text)
             if len(ids) >= need:
                 break
-        if not files:
-            raise SystemExit("no source files found for the prompts")
     return ids
 
 
@@ -115,6 +157,8 @@ def main() -> int:
     ap.add_argument("--label", default="", help="names the run in the output (not part of the prompts)")
     ap.add_argument("--tag", default="bench", help="the word every prompt starts with: two runs with the same tag read "
                                                     "the same prompts, so --compare can match their tokens")
+    ap.add_argument("--corpus-rev", default=CORPUS_REV, help='the commit whose source the prompts are cut from '
+                                                              f'(default {CORPUS_REV}); "worktree": the files as they are')
     ap.add_argument("--out", default="multi_gpu_bench.jsonl", help="JSON lines appended here")
     ap.add_argument("--tokens-out", help="the generated ids of every request, as JSON (for --compare)")
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"), help="compare two --tokens-out files and exit")
@@ -156,7 +200,7 @@ def main() -> int:
         args = with_arg(args, "--max-context", str(max(lengths) + a.max_new + 1024))
         print(f"--max-context raised to {max(lengths) + a.max_new + 1024} for the longest prompt")
     tok = load_tokenizer(Path(cfg["tokenizer"]))
-    body = corpus_ids(tok, max(lengths))
+    body = corpus_ids(tok, max(lengths), None if a.corpus_rev == "worktree" else a.corpus_rev)
     gpus = cfg.get("gpu")
     label = a.label or f"gpus={gpus}"
     print(f"[{label}] engine args: {' '.join(args)}")

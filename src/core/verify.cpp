@@ -686,7 +686,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
                                  s, scores_ + (size_t) tb * max_blocks_, cs);
                 stamp(l, 15, grp);   // the profile's "  scores" (of scores+topk; slot 15 is otherwise unused)
-                // past the register kernel's capacity, the top-k on 32 CTAs per query (sm_70 to sm_89; the same ids)
+                // a capacity over 64K cells: the top-k on 32 CTAs per query (sm_70 to sm_89; the same ids)
                 if (!qsa_block_topk_split(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_,
                                           cap_, s, sel_ + (size_t) tb * cap_, topk_scratch_, cs))
                     qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,

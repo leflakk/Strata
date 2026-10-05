@@ -3710,6 +3710,8 @@ def main() -> int:
         args += ["--resident-budget-gib", f"{budget:g}"]   # GiB kept in RAM (#498: a layer split has no budget)
     if q4_split and vram_all:                 # all on the GPUs: mapped from the GGUFs, nothing loaded into RAM
         args += ["--mmap-experts"]
+    if vram_all:   # the draft layer attends to the last 16K cells instead of 32K: 4x RTX 3090, IQ3_S, decode +2% at
+        args += ["--mtp-window", "16384"]   # 128K and +4% at 250K, the same answers (docs/MULTI_GPU.md)
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
     if a.vram_reserve_mib is not None:                 # #493: VRAM left free for other programs (only when given)

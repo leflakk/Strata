@@ -56,7 +56,7 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
 /// `scratch`: qsa_topk_split_bytes(nq) bytes of device memory, zero before the first call (each call leaves it so), for
 /// one call at a time.  Capturable.  False (nothing launched) where the one-CTA or cluster kernels run instead: HIP,
 /// sm_90+, below sm_70, more than 16 queries, no scratch, STRATA_TOPK_SPLIT=0, or (unless STRATA_TOPK_SPLIT=1) a
-/// capacity the register kernel holds.
+/// capacity of 64K cells or less.
 size_t qsa_topk_split_bytes(int64_t nq);
 bool qsa_block_topk_split(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                           const QsaShapes& s, int32_t* ids, void* scratch, void* stream);

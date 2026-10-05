@@ -1496,15 +1496,17 @@ bool qsa_block_topk_split(const float* scores, const int32_t* steps, int64_t nq,
     (void) stream;
     return false;
 #else
-    // STRATA_TOPK_SPLIT: unset = past the register kernel's capacity (where one CTA reads every query's scores from
-    // memory on each pass), 1 = at any capacity, 0 = never
+    // STRATA_TOPK_SPLIT: unset = a capacity over 64K cells, 1 = at any capacity, 0 = never.  RTX 3090, 3 queries,
+    // capacity 128K (the register kernel's domain): register kernel / split 0.029 / 0.034 ms at a 4K or 16K context,
+    // 0.036 / 0.035 at 32K, 0.039 / 0.035 at 64K, 0.080 / 0.036 at 120K; past the register capacity (a 262K
+    // --max-context) the one-CTA kernel is 7x slower at 250K
     static const int mode = [] {
         const char* v = std::getenv("STRATA_TOPK_SPLIT");
         return !v ? 1 : std::atoi(v) != 0 ? 2 : 0;
     }();
     if (nq <= 0) return true;
     if (mode == 0 || scratch == nullptr || nq > CL_MAXQ || max_blocks <= 0 || s.idx_block != R ||
-        cap < qsa_selection_width(kTopkMaxCells, s) || (mode == 1 && max_blocks <= (int64_t) TK_T * TK_PER))
+        cap < qsa_selection_width(kTopkMaxCells, s) || (mode == 1 && max_blocks <= 65536 / R + 2))
         return false;
     // per device: 1 it runs here (sm_70 to sm_89: __match_any_sync, and no clusters - sm_90+ has the cluster kernel),
     // 2 it does not

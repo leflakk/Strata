@@ -489,6 +489,7 @@ class AllOnTheGpus(unittest.TestCase):
         self.assertNotIn("low-RAM mode on 4 GPUs", out)
         self.assertNotIn("Writing the experts into one file", out)          # no experts.bin: the GGUF in place
         self.assertEqual((cfg.get("env") or {}).get("STRATA_PF_FUSED"), "1")  # RTX 30: the fused prompt experts
+        self.assertEqual(cfg["args"][cfg["args"].index("--mtp-window") + 1], "16384")
 
     def test_fused_prompt_experts_only_all_on_rtx_30(self):
         from test_setup_golden import install
@@ -501,6 +502,7 @@ class AllOnTheGpus(unittest.TestCase):
         code, out, cfg, _ = install(127.8, self.cards(4), argv + ["--low-ram", "off", "--context", "32768"])
         self.assertEqual(code, 0, out)                                        # RTX 30, experts kept in RAM
         self.assertNotIn("STRATA_PF_FUSED", cfg.get("env") or {})
+        self.assertNotIn("--mtp-window", cfg["args"])                         # the engine's 32K window
 
     def test_low_ram_off_keeps_ram(self):
         from test_setup_golden import install

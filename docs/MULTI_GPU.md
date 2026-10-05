@@ -133,11 +133,27 @@ adding once - the same selection rule, so the same cells (RTX 50 cards keep thei
 `STRATA_TOPK_WIDE=0`: the previous kernel; `=decode`: the new one for decode windows only. A decode window has only
 1-5 queries, so a one-CTA kernel still runs on 1-5 SMs while the rest of the GPU idles: the windows now cut each
 query's blocks into 32 slices, one per CTA, and run each radix pass as one launch whose last CTA picks the digit
-(then a count and an emit launch) - again the same cells (RTX 20/30/40 cards; `STRATA_TOPK_SPLIT=0`: the one-CTA
-kernel; `=1`: also at the capacities the register kernel holds). The block scores of a window sum the four indexer
+(then a count and an emit launch) - again the same cells (RTX 20/30/40 cards, a `--max-context` over 64K cells;
+`STRATA_TOPK_SPLIT=0`: the one-CTA kernels; `=1`: at any capacity). On 4x RTX 3090 at a 250K context the selection
+went from 1.3 to 0.3 ms per card and window, decode from 80 to 95 tokens/s, and a window now costs about what it costs
+at 4K. The block scores of a window sum the four indexer
 heads with 9 warp shuffles instead of 20, bitwise the same scores (`STRATA_SCORES_RS=0`: the previous kernel).
 `qsa_decode_bench` (`cmake --build build --target qsa_decode_bench`) times these kernels alone at a given context and
 checks that their scores and cells are the same as the reference kernels'.
+
+**The hyper-connection reads in decode** (every card, any number of them): two per layer, each a norm, a 10240 -> 320
+"down" projection and a 320 -> 10240 "up" projection of BF16 weights (6.5 MB each). The down projection ran on 41
+blocks (half the SMs of an RTX 3090) with its activations staged behind a barrier per tile, the up projection waited
+one memory latency per row: ~45 us per read on an RTX 3090, 17% of a decode window's GPU time (nsys, 4x RTX 3090,
+250K). The `direct` read runs the down projection on 81 blocks with two groups of weight loads in flight and no
+staging, and loads each up warp's eight rows at once - every output computed with the same operations in the same
+order. Like the earlier variants it is compared with the plain read bit for bit on each card at start (the log says
+`the hyper-connection read runs as direct ...`), and a card where it differs keeps the previous one.
+`STRATA_HC_SPLIT=2`: at most the previous (staged) read; `=1` split; `=0` the plain read.
+
+**The draft layer's window**: setup writes `--mtp-window 16384` when every expert is on the GPUs: the draft layer
+attends to the last 16K cells instead of 32K. 4x RTX 3090, IQ3_S: decode +2% at 128K and +4% at 250K, the same tokens
+(greedy decoding verifies every draft; the window changes only how many are accepted, and it barely did).
 
 **Prompt experts on RTX 30 cards**: when every expert is on the GPUs and every card is compute capability 8.6, setup
 writes `STRATA_PF_FUSED=1` into the config's `env`: the prompt's experts run on the fused int8 tensor-core kernels,
@@ -162,7 +178,11 @@ context is the model's 262K window when the cards still hold everything there. `
 RAM as before.
 
 `tools/multi_gpu_bench.py` measures a configuration: prompt and decode speed at given lengths through the engine's own
-numbers, and the generated tokens for an A/B comparison:
+numbers, and the generated tokens for an A/B comparison. Its prompts are cut from this repository's source as it was
+at a fixed commit (`--corpus-rev`), so runs of different versions of the code read the same prompts and their tokens
+can be compared. `--wrap "nsys profile ..."` runs the engine under a profiler, and `STRATA_CUDA_PROFILE=<cells>:<n>`
+limits the capture to n decode rounds from that context on (`--capture-range=cudaProfilerApi
+--capture-range-end=stop`):
 
 ```
 python tools/multi_gpu_bench.py strata-iq3_s.json --gpus all --lengths 4096,32768,131072 --tokens-out new.json

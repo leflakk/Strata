@@ -53,12 +53,14 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
 /// every output with the plain read's operations in its order, so bitwise the plain read's and the single-token
 /// read's: plain (0.1.31's default: the norm one block per token, the down projection on 41 blocks), split (the norm
 /// one block per token and stream, then the plain down projection) and staged (split's norm, and the down
-/// projection's activations staged ahead by cp.async, two half-stream tiles in flight, bank-conflict-free).
+/// projection's activations staged ahead by cp.async, two half-stream tiles in flight, bank-conflict-free) and direct
+/// (CUDA: split's norm, the down projection on 81 blocks without staging and two groups of weight loads in flight, the
+/// up projection's rows of a warp loaded at once).
 /// `fused_gr_check` runs all of them and the single-token read on the current card with random weights and inputs
 /// (1..8 tokens, with and without the pending write) and from then on uses there the newest one that agrees with the
-/// plain read bit for bit; STRATA_HC_SPLIT=0 keeps the plain read, =1 stops at split.  It runs once per card
-/// (Verifier::init calls it) and prints which one runs.  On a card it has not checked, `fused_gr_variant` is the
-/// plain read unless STRATA_HC_SPLIT=1 or 2 names a variant.
+/// plain read bit for bit; STRATA_HC_SPLIT=0 keeps the plain read, =1 stops at split, =2 at staged.  It runs once per
+/// card (Verifier::init calls it) and prints which one runs.  On a card it has not checked, `fused_gr_variant` is the
+/// plain read unless STRATA_HC_SPLIT=1, 2 or 3 names a variant.
 void fused_gr_check();
 int fused_gr_variant();
 
