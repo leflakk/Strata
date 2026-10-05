@@ -52,15 +52,16 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
 /// The multi read's variants (#315; not main's opt-in STRATA_GR_V3 read, which sums in another order), all computing
 /// every output with the plain read's operations in its order, so bitwise the plain read's and the single-token
 /// read's: plain (0.1.31's default: the norm one block per token, the down projection on 41 blocks), split (the norm
-/// one block per token and stream, then the plain down projection) and staged (split's norm, and the down
-/// projection's activations staged ahead by cp.async, two half-stream tiles in flight, bank-conflict-free) and direct
-/// (CUDA: split's norm, the down projection on 81 blocks without staging and two groups of weight loads in flight, the
-/// up projection's rows of a warp loaded at once).
+/// one block per token and stream, then the plain down projection), staged (split's norm, and the down projection's
+/// activations staged ahead by cp.async, two half-stream tiles in flight, bank-conflict-free) and, CUDA only, direct
+/// (the down projection on 81 blocks without staging, its weights through L2 only), pf (staged with the down weights two
+/// tiles ahead) and the up projection with the next row loaded ahead, in the combinations fused_gr.cu lists.
 /// `fused_gr_check` runs all of them and the single-token read on the current card with random weights and inputs
-/// (1..8 tokens, with and without the pending write) and from then on uses there the newest one that agrees with the
-/// plain read bit for bit; STRATA_HC_SPLIT=0 keeps the plain read, =1 stops at split, =2 at staged.  It runs once per
-/// card (Verifier::init calls it) and prints which one runs.  On a card it has not checked, `fused_gr_variant` is the
-/// plain read unless STRATA_HC_SPLIT=1, 2 or 3 names a variant.
+/// (1..8 tokens, with and without the pending write), times the ones that agree with the plain read bit for bit on a
+/// 3-token read, and from then on uses there the fastest (staged unless another is 2% faster); STRATA_HC_SPLIT=<digit>
+/// names one instead (0 plain, 1 split, 2 staged, 3 direct, 4 pf, 5 staged + pf up, 6 pf down).  It runs once per card
+/// (Verifier::init calls it) and prints which one runs and the times.  On a card it has not checked,
+/// `fused_gr_variant` is the plain read unless STRATA_HC_SPLIT names a variant.
 void fused_gr_check();
 int fused_gr_variant();
 
