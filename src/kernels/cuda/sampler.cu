@@ -26,6 +26,7 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -167,6 +168,64 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
         if (lane == 0) out[t] = (wi < n_vocab) ? wi : 0;
     }
 }
+
+#if !defined(__HIPCC__)
+/// **THE ONE-BLOCK ARGMAX WITH LOADS IN FLIGHT, FOR CARDS WITHOUT CLUSTERS (calls without penalties).**  The one-block
+/// kernel reads its row one float per thread at a time: latency-bound, ~36-50 us per 248,320-logit row on an RTX 3090
+/// (nsys, a verify window's head and each draft step).  Here each thread keeps kAmVecUnroll float4 loads in flight.
+/// The answer is sampler_greedy_kernel's bit for bit, as for the cluster kernel: a thread walks its elements in
+/// ascending order with a strict `>` (its lowest index among its largest values), every merge takes the larger value
+/// or, on equality, the smaller index (an order-free rule), NaN never wins, and 0 when nothing beats -inf.
+constexpr int kAmVecThreads = 1024;
+constexpr int kAmVecUnroll = 4;
+__global__ void __launch_bounds__(kAmVecThreads) sampler_greedy_vec_kernel(const float* __restrict__ logits,
+                                                                           int n_vocab, int* __restrict__ out) {
+    const int t = blockIdx.x;
+    const float4* l4 = reinterpret_cast<const float4*>(logits + (size_t) t * n_vocab);
+    const int n4 = n_vocab / 4;
+    float bv = __int_as_float(0xff800000);   // -inf
+    int best = n_vocab;                      // "no candidate"
+    for (int i0 = (int) threadIdx.x; i0 < n4; i0 += kAmVecThreads * kAmVecUnroll) {
+        float4 x[kAmVecUnroll];
+#pragma unroll
+        for (int u = 0; u < kAmVecUnroll; ++u) {
+            const int i = i0 + u * kAmVecThreads;
+            if (i < n4) x[u] = __ldg(l4 + i);
+        }
+#pragma unroll
+        for (int u = 0; u < kAmVecUnroll; ++u) {
+            const int i = i0 + u * kAmVecThreads;
+            if (i >= n4) break;
+            const int v = 4 * i;
+            if (x[u].x > bv) { bv = x[u].x; best = v; }
+            if (x[u].y > bv) { bv = x[u].y; best = v + 1; }
+            if (x[u].z > bv) { bv = x[u].z; best = v + 2; }
+            if (x[u].w > bv) { bv = x[u].w; best = v + 3; }
+        }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+        const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
+        if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
+    }
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+    if (lane == 0) { sv[warp] = bv; si[warp] = best; }
+    __syncthreads();
+    if (warp == 0) {
+        const int nw = (int) ((blockDim.x + 31) >> 5);
+        float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
+        int wi = lane < nw ? si[lane] : n_vocab;
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xFFFFFFFFu, wv, off);
+            const int oi = __shfl_down_sync(0xFFFFFFFFu, wi, off);
+            if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
+        }
+        if (lane == 0) out[t] = (wi < n_vocab) ? wi : 0;
+    }
+}
+#endif  // !__HIPCC__
 
 #if !defined(__HIPCC__)
 /// **THE SAME ARGMAX ON A THREAD-BLOCK CLUSTER (sm_90+, S19), FOR THE CALLS WITHOUT PENALTIES.**  One block per
@@ -994,9 +1053,22 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         }();
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
-        if (!(multi && shmem == 0 && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
+        if (!(multi && shmem == 0 && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream))) {
+#if !defined(__HIPCC__)
+            // without penalties, rows of whole float4: the kernel with loads in flight (the same token).
+            // STRATA_ARGMAX_VEC=0: the one-load kernel
+            static const bool vec = [] {
+                const char* v = std::getenv("STRATA_ARGMAX_VEC");
+                return !v || std::atoi(v) != 0;
+            }();
+            if (vec && multi && shmem == 0 && n_vocab % 4 == 0 && ((uintptr_t) logits & 15u) == 0) {
+                sampler_greedy_vec_kernel<<<(unsigned) n_tokens, kAmVecThreads, 0, (cudaStream_t) stream>>>(logits, n_vocab,
+                                                                                                          out);
+            } else
+#endif
             sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
                 logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
+        }
     } else if (sampled_path() == SampledPath::Old) {
         // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
         // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.

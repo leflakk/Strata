@@ -144,18 +144,18 @@ checks that their scores and cells are the same as the reference kernels'.
 **The hyper-connection reads in decode** (every card, any number of them): two per layer, each a norm, a 10240 -> 320
 "down" projection and a 320 -> 10240 "up" projection of BF16 weights (6.5 MB each), ~45 us per read on an RTX 3090 and
 17% of a decode window's GPU time (nsys, 4x RTX 3090, 250K). Besides the plain read and its two earlier variants
-(split, staged), CUDA builds have four more that compute every output with the same operations in the same order:
-the down projection with its weights two tiles ahead (`pf`), or on 81 blocks without staging (`direct`), and the up
-projection with the next row loaded ahead. At start each card compares every variant with the plain read bit for bit
-(1..8 tokens, with and without the pending write), times the ones that agree on a 3-token read, and uses the fastest
-(staged unless another is 2% faster); the log lists the times: `strata hc: CUDA0: the hyper-connection read runs as
-... us per 3-token read: plain .., split .., staged .., ...`. A variant that differs on a card is never used there.
-`STRATA_HC_SPLIT=<digit>` forces one (0 plain, 1 split, 2 staged, 3 direct, 4 pf, 5 staged + pf up, 6 pf down).
-(Round 6 made `direct` the default without timing it: exact, but 5% slower in decode on RTX 3090s - hence the timing.)
+(split, staged), CUDA builds have `pf` and `pf3`: staged with the down projection's weights two or three tiles ahead,
+every output computed with the same operations in the same order. At start each card compares every variant with the
+plain read bit for bit (1..8 tokens, with and without the pending write), times the ones that agree on a 3-token read,
+and uses the fastest (staged unless another is 2% faster); the log lists the times (`strata hc: CUDA0: the
+hyper-connection read runs as pf ...; us per 3-token read: plain 52.3, split 49.6, staged 47.2, pf 43.6, ...`). A
+variant that differs on a card is never used there. 4x RTX 3090: pf on every card, decode +1.6-1.9% up to 128K.
+`STRATA_HC_SPLIT=<digit>` forces one (0 plain, 1 split, 2 staged, 3 pf, 4 pf3).
 
-**The attention's value reads** (opt-in, `STRATA_ATTN_PF=1`, INT8 KV cache): the decode attention's chunk kernel loads
-a warp's key rows and its value entries ahead of their use instead of waiting on one row per cell; the same arithmetic
-in the same order.
+**Smaller decode kernels, the same bits**: the attention's merge of its 64-cell chunks loads eight chunks at a time
+(26 -> 11 us per call on an RTX 3090; `STRATA_ATTN_PF=0`: the previous merge), and the greedy argmax over the
+vocabulary keeps four float4 loads in flight per thread on cards without clusters (`STRATA_ARGMAX_VEC=0`: the previous
+kernel).
 
 **The draft layer's window**: setup writes `--mtp-window 16384` when every expert is on the GPUs: the draft layer
 attends to the last 16K cells instead of 32K. 4x RTX 3090, IQ3_S: decode +2% at 128K and +4% at 250K, the same tokens
