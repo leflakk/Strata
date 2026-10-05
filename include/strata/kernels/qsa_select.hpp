@@ -19,6 +19,7 @@
 
 #include "strata/kernels/qsa.hpp"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strata::kernels {
@@ -49,6 +50,15 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
 /// build below sm_90, or a capacity whose keys do not fit one cluster's shared memory. Capturable.
 bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                             const QsaShapes& s, int32_t* ids, void* stream);
+/// The same ids on 32 CTAs per query for the decode windows of cards without clusters (CUDA sm_70 to sm_89): four
+/// radix-pass launches whose last CTA picks each digit from the slices' histograms, then a count and an emit launch.
+/// `scratch`: qsa_topk_split_bytes(nq) bytes of device memory, zero before the first call (each call leaves it so), for
+/// one call at a time.  Capturable.  False (nothing launched) where the one-CTA or cluster kernels run instead: HIP,
+/// sm_90+, below sm_70, more than 16 queries, no scratch, STRATA_TOPK_SPLIT=0, or (unless STRATA_TOPK_SPLIT=1) a
+/// capacity the register kernel holds.
+size_t qsa_topk_split_bytes(int64_t nq);
+bool qsa_block_topk_split(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                          const QsaShapes& s, int32_t* ids, void* scratch, void* stream);
 /// The original kernel (keys read from memory on every radix pass), for tests: the same ids.
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                         const QsaShapes& s, int32_t* ids, void* stream);

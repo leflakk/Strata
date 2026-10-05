@@ -311,6 +311,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
         scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
+        topk_scratch_ = b.take<uint8_t>(strata::kernels::qsa_topk_split_bytes((int64_t) T));
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
@@ -684,8 +685,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 10, grp);
                 qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
                                  s, scores_ + (size_t) tb * max_blocks_, cs);
-                qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
-                               sel_ + (size_t) tb * cap_, cs);
+                stamp(l, 15, grp);   // the profile's "  scores" (of scores+topk; slot 15 is otherwise unused)
+                // past the register kernel's capacity, the top-k on 32 CTAs per query (sm_70 to sm_89; the same ids)
+                if (!qsa_block_topk_split(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_,
+                                          cap_, s, sel_ + (size_t) tb * cap_, topk_scratch_, cs))
+                    qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
+                                   sel_ + (size_t) tb * cap_, cs);
                 stamp(l, 11, grp);
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
@@ -951,7 +956,7 @@ std::string Verifier::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
     static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
-                                          "attention", "gate", "", "out-proj", "hc-read1+router", "shared+quant",
+                                          "attention", "gate", "  of which scores", "out-proj", "hc-read1+router", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
                                           "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "", "", ""};
     std::string out;
@@ -961,7 +966,7 @@ std::string Verifier::profile_report() {
         out += k == 0 ? " GDN layers:" : " | QSA layers:";
         for (int i = 0; i < kProfPer; ++i) {
             if (prof_sum_[k][i] <= 0) continue;
-            total += prof_sum_[k][i];
+            if (i != 15) total += prof_sum_[k][i];   // 15 is a share of scores+topk, already counted
             std::snprintf(b, sizeof b, " %s %.2f", names[i], prof_sum_[k][i] / 1e6 / (double) prof_windows_);
             out += b;
         }
@@ -1284,6 +1289,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 prev = x;
             }
             if (l + 1 < L) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
+            // stamp 15 sits inside scores+topk, between the scores and the top-k: the loop above skips it (it is
+            // earlier than stamp 14), so the scores' share is added here as a sub-column
+            if (const double ds = gap(at(l, 15), at(l, 10)); ds > 0 && at(l, 11) >= at(l, 15)) prof_sum_[kind][15] += ds;
             const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
             if (dn > 0 && dd > 0 && du > 0) {   // the split exists: show it split, not twice
                 prof_sum_[kind][27] += dn;      // hc-read0: norm

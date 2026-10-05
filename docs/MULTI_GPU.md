@@ -130,7 +130,20 @@ over ~135K cells, so every decode window of a 262K context), the attention's blo
 whose histogram increments serialized; on 4x RTX 3090 at a 250K context it cost ~0.4 ms per attention layer and decode
 window (~20% of the window). It now runs a 1,024-thread kernel with per-warp histograms and the lanes of one digit
 adding once - the same selection rule, so the same cells (RTX 50 cards keep their cluster kernel).
-`STRATA_TOPK_WIDE=0`: the previous kernel; `=decode`: the new one for decode windows only.
+`STRATA_TOPK_WIDE=0`: the previous kernel; `=decode`: the new one for decode windows only. A decode window has only
+1-5 queries, so a one-CTA kernel still runs on 1-5 SMs while the rest of the GPU idles: the windows now cut each
+query's blocks into 32 slices, one per CTA, and run each radix pass as one launch whose last CTA picks the digit
+(then a count and an emit launch) - again the same cells (RTX 20/30/40 cards; `STRATA_TOPK_SPLIT=0`: the one-CTA
+kernel; `=1`: also at the capacities the register kernel holds). The block scores of a window sum the four indexer
+heads with 9 warp shuffles instead of 20, bitwise the same scores (`STRATA_SCORES_RS=0`: the previous kernel).
+`qsa_decode_bench` (`cmake --build build --target qsa_decode_bench`) times these kernels alone at a given context and
+checks that their scores and cells are the same as the reference kernels'.
+
+**Prompt experts on RTX 30 cards**: when every expert is on the GPUs and every card is compute capability 8.6, setup
+writes `STRATA_PF_FUSED=1` into the config's `env`: the prompt's experts run on the fused int8 tensor-core kernels,
+grouped on the GPU (no host sort per layer). IQ3_S on 4x RTX 3090 at a 262K context: prompts +13% at 4K, +19% at 32K,
++10% at 128K and 250K; the long-context needle tests (32K/128K/250K at depths 10/50/90%) all found, as with MMQ. The
+int8 rounding differs from MMQ's, so the tokens can differ. `"STRATA_PF_FUSED": "0"` in the config keeps MMQ.
 
 **The n-gram table in RAM** (`--ple-io ram`, Linux): the table (28.8 GB) is read once at start and locked, instead of
 16 unbuffered SSD reads per token. On 8x RTX 3090 with every expert in VRAM, the first card waited 3.4 s for those

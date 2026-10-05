@@ -3748,6 +3748,11 @@ def main() -> int:
             cfg["env"] = {"STRATA_HIPBLASLT_TUNING": str(table)}
         if resident:   # ROCm: large page-locked host allocations can fail or be slow for the CPU; keep the copy pageable
             cfg.setdefault("env", {})["STRATA_RESIDENT_PIN"] = "0"
+    if vram_all and not hip and all(x.get("arch") == "86" for x in chosen):
+        # all on RTX 30 cards (compute capability 8.6): the prompt's experts on the fused int8 kernels, grouped on the
+        # GPU (IQ3_S on four RTX 3090 at 262K: prompts +10-20% from 4K to 250K, the long-context needle tests the same
+        # as with MMQ - docs/MULTI_GPU.md).  STRATA_PF_FUSED=0 in the config's "env" keeps MMQ.
+        cfg.setdefault("env", {})["STRATA_PF_FUSED"] = "1"
     if gpu["count"] > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]                      # the engine is told this card (issue #51)
         cfg["gpus_asked"] = True                       # chosen at setup: not asked again at start

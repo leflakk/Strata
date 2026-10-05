@@ -488,6 +488,19 @@ class AllOnTheGpus(unittest.TestCase):
         self.assertEqual(cfg["args"][cfg["args"].index("--max-context") + 1], "262144")   # the model's window
         self.assertNotIn("low-RAM mode on 4 GPUs", out)
         self.assertNotIn("Writing the experts into one file", out)          # no experts.bin: the GGUF in place
+        self.assertEqual((cfg.get("env") or {}).get("STRATA_PF_FUSED"), "1")  # RTX 30: the fused prompt experts
+
+    def test_fused_prompt_experts_only_all_on_rtx_30(self):
+        from test_setup_golden import install
+        argv = ["--family", "qwen", "--model", "IQ3_S", "--gpus", "0,1,2,3", "--no-start"]
+        ada = [self.card(i, "NVIDIA GeForce RTX 4090", 24.0, "89") for i in range(4)]
+        code, out, cfg, _ = install(63.7, ada, argv)                         # all on the GPUs, but not measured there
+        self.assertEqual(code, 0, out)
+        self.assertIn("--mmap-experts", cfg["args"])
+        self.assertNotIn("STRATA_PF_FUSED", cfg.get("env") or {})
+        code, out, cfg, _ = install(127.8, self.cards(4), argv + ["--low-ram", "off", "--context", "32768"])
+        self.assertEqual(code, 0, out)                                        # RTX 30, experts kept in RAM
+        self.assertNotIn("STRATA_PF_FUSED", cfg.get("env") or {})
 
     def test_low_ram_off_keeps_ram(self):
         from test_setup_golden import install

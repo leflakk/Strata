@@ -283,6 +283,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME qsa_topk_active_parity COMMAND qsa_topk_active_parity)
     set_tests_properties(qsa_topk_active_parity PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # the decode window's QSA selection timed alone (block scores + top-k at the window's shapes under a 262K capacity),
+  # the reference top-k's ids against the default dispatch's: built on request, `cmake --build build --target
+  # qsa_decode_bench` (GPU, synthetic, no model)
+  if(STRATA_ENABLE_CUDA)
+    add_executable(qsa_decode_bench EXCLUDE_FROM_ALL src/kernels/qsa_decode_bench.cpp)
+    target_include_directories(qsa_decode_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(qsa_decode_bench PRIVATE strata_kernels CUDA::cudart)
+  endif()
   # the QSA selection (block scores on the warp kernel and the tensor-core one, top-k): a GPU bench with a
   # scorer-vs-scorer comparison and an FP64 accuracy gate (synthetic, no model); the ctest runs a 32K context under a
   # 262144-cell capacity (the top-k dispatch follows the capacity) and exits non-zero on a failed gate
